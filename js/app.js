@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v10';
+const APP_VER = 'v11';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -218,14 +218,22 @@ async function fetchDevices() {
   const j = jsonOk(res);
   let devs = Array.isArray(j) ? j : (j.content || j.devices || j.data || []);
   state.devices = devs;
-  state.device = devs[0] || null;
-  if (state.device) {
-    const d = state.device;
+  const picked = devs.find(d => d.online) || devs[0] || null;
+  state.device = picked;
+  if (picked) {
+    const d = picked;
     state.deviceId = d.device_id || d.id || d.sn;
     const id = state.deviceId;
+    const nOnline = devs.filter(x => x.online).length;
     $('dev-name').textContent = d.name || 'Jarvis';
-    $('dev-sub').textContent = (d.model || '') + ' · ' + String(id || '').slice(0, 8);
-    log('device: ' + JSON.stringify({ name: d.name, model: d.model, online: d.online, wl: d.work_status, map: d.current_map }).slice(0, 200));
+    $('dev-sub').textContent = (d.model || '') + ' · ' + String(id || '').slice(0, 8) +
+      ' · ' + (devs.length || 1) + ' dev, ' + nOnline + ' online';
+    log('devices: ' + JSON.stringify(devs.slice(0, 8).map(x => ({
+      id: String(x.device_id || x.id || x.sn || '').slice(0, 8),
+      on: !!x.online,
+      seen: x.sl_last_seen || x.last_seen || null
+    }))) + (devs.length > 8 ? ' …(+' + (devs.length - 8) + ')' : ''));
+    log('picked: ' + String(id || '').slice(0, 8) + (d.online ? ' (online)' : ' (offline)'));
     updateOnlineBadge();
     return id;
   }
@@ -245,8 +253,10 @@ function updateOnlineBadge() {
   } else {
     pill.textContent = 'Offline';
     pill.className = 'pill off';
+    const nDev = state.devices && state.devices.length;
     banner.textContent = 'Robot is offline (last seen ' + (d.sl_last_seen || d.last_seen || '?') +
-      '). Switch it on and connect it to WiFi, then refresh.';
+      '). Switch it on and connect it to WiFi, then press "Check robot now".' +
+      (nDev > 1 ? ' Your account has ' + nDev + ' robot entries; the app auto-picks the online one.' : '');
     banner.classList.remove('hidden');
   }
 }
@@ -362,8 +372,17 @@ async function pollDeviceStatus() {
     if (!res.ok) return 'status check failed (HTTP ' + res.status + ')';
     const j = safeJson(res.body);
     const devs = Array.isArray(j) ? j : (j && (j.content || j.devices || j.data)) || [];
-    const d = devs.find(x => (x.device_id || x.id || x.sn) === state.deviceId) || devs[0] || null;
+    const curId = state.deviceId;
+    const d = devs.find(x => (x.device_id || x.id || x.sn) === curId && x.online) ||
+      devs.find(x => x.online) ||
+      devs.find(x => (x.device_id || x.id || x.sn) === curId) ||
+      devs[0] || null;
     if (!d) return 'robot not found in account';
+    const newId = d.device_id || d.id || d.sn;
+    if (newId && newId !== curId) {
+      state.deviceId = newId;
+      log('switched device to ' + String(newId).slice(0, 8) + ' (previous one offline)');
+    }
     const wasOnline = !!(state.device && state.device.online);
     const nowOnline = !!d.online;
     if (state.device) state.device = Object.assign({}, state.device, d); else state.device = d;
