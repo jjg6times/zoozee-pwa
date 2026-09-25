@@ -85,6 +85,7 @@ const state = {
   mqtt: new MqttClient(),
   mqttOk: false,
   mqttReconnecting: false,
+  mqttConnecting: false,
   maps: [],            // received map tiles: {grid, dimX, dimY, res, realX, realY}
   mapCache: new Map(), // tileKey -> {tile, canvas, dirty}
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
@@ -276,12 +277,14 @@ function renderStatus() {
 /* ================= MQTT ================= */
 function connectMqtt(deviceId) {
   const m = state.mqtt;
+  state.mqttConnecting = true;
   m.connect(CFG.WS, {
     clientId: access,
     username: access,
     password: CFG.MQTT_PWD
   });
   m.onConnect = (errCode) => {
+    state.mqttConnecting = false;
     if (errCode) {
       log('MQTT CONNACK rc=' + errCode);
       setCtrlEnabled(false);
@@ -301,6 +304,7 @@ function connectMqtt(deviceId) {
   };
   m.onMessage = (topic, payload, raw) => handleAppMessage(topic, payload, raw);
   m.onClose = () => {
+    state.mqttConnecting = false;
     log('MQTT disconnected');
     state.mqttOk = false;
     setCtrlEnabled(false);
@@ -323,6 +327,52 @@ function scheduleReconnect(reason, useRefresh) {
       .catch((e) => { state.mqttReconnecting = false; state.retry.delay = Math.min(state.retry.delay * 2, 30000); log('reconnect failed: ' + e.message); scheduleReconnect('retry', false); });
   }, delay);
   state.retry.delay = Math.min(state.retry.delay * 2, 30000);
+}
+
+let statusTimer = null;
+function startStatusPoll() {
+  stopStatusPoll();
+  pollDeviceStatus();
+  statusTimer = setInterval(pollDeviceStatus, 30000);
+}
+function stopStatusPoll() {
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+}
+
+async function pollDeviceStatus() {
+  if (!state.deviceId || !store.email) return;
+  try {
+    await ensureAccess();
+    const res = await http('/api/devices?user=' + encodeURIComponent(store.email) +
+      '&with_location=true&with_owner=true&page=0&size=20', {
+      headers: { 'Accept': 'application/vnd.slamtec.devicelist-v1.0+json' }
+    });
+    if (!res.ok) return;
+    const j = safeJson(res.body);
+    const devs = Array.isArray(j) ? j : (j && (j.content || j.devices || j.data)) || [];
+    const d = devs.find(x => (x.device_id || x.id || x.sn) === state.deviceId) || devs[0] || null;
+    if (!d) return;
+    const wasOnline = !!(state.device && state.device.online);
+    const nowOnline = !!d.online;
+    if (state.device) state.device = Object.assign({}, state.device, d); else state.device = d;
+    updateOnlineBadge();
+    if (nowOnline && !wasOnline) {
+      log('robot is back online');
+      if (!state.mqtt.connected && !state.mqttConnecting && !state.mqttReconnecting) {
+        log('connecting…');
+        connectMqtt(state.deviceId);
+      } else {
+        state.mqttOk = true;
+        setCtrlEnabled(true);
+      }
+    }
+    if (!nowOnline && state.mqttOk) {
+      setCtrlEnabled(false);
+      state.mqttOk = false;
+    }
+  } catch (e) {
+    log('status poll error: ' + e.message);
+  }
 }
 
 function setCtrlEnabled(on) {
@@ -1044,6 +1094,7 @@ function clearState() {
 }
 
 function logout() {
+  stopStatusPoll();
   state.mqtt.disconnect();
   state.mqttOk = false;
   clearTimeout(state.retry.timer);
@@ -1086,6 +1137,7 @@ async function enterMain() {
     const deviceId = await fetchDevices();
     connectMqtt(deviceId);
     pingLoop();
+    startStatusPoll();
     refreshSchedules();
     if (state.deviceId) ctrlMsg('', false);
   } catch (err) {
