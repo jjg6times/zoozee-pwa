@@ -139,6 +139,9 @@ html, body {
   border: 1px solid rgba(255,190,70,.4);
   color: #ffd27d;
 }
+.banner.online { background: rgba(61, 220, 132, .12); border: 1px solid rgba(61, 220, 132, .4); color: #9fe9c0; }
+.ctrl.checking { color: var(--muted); }
+.ctrl.err { color: #fff; background: var(--warn); border-color: var(--warn); }
 
 main { padding: 14px; display: flex; flex-direction: column; gap: 14px; }
 

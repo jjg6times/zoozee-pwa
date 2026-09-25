@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v9';
+const APP_VER = 'v10';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -1123,16 +1123,37 @@ function wireControls() {
   onEvent('carpet-boost', 'change', (e) => toggleCarpetBoost(!!e.target.checked));
   on('btn-check-now', async () => {
     const btn = $('btn-check-now');
-    const oldTxt = btn ? btn.textContent : '';
-    if (btn) { btn.textContent = 'Checking…'; btn.disabled = true; }
-    $('ctrl-msg').textContent = 'checking robot…';
-    $('ctrl-msg').className = 'msg';
-    requestNetworkInfo();
-    const st = await pollDeviceStatus();
-    if (btn) { btn.textContent = oldTxt; btn.disabled = false; }
-    $('ctrl-msg').textContent = st;
-    $('ctrl-msg').className = st.indexOf('online') >= 0 ? 'msg ok' : 'msg';
-    log('check result: ' + st);
+    const b = $('banner');
+    const stamp = () => new Date().toLocaleTimeString();
+    try {
+      if (btn) { btn.textContent = 'Checking…'; btn.disabled = true; btn.classList.add('checking'); }
+      requestNetworkInfo();
+      const st = await pollDeviceStatus();
+      if (btn) { btn.disabled = false; btn.classList.remove('checking'); }
+      if (/online/.test(st)) {
+        if (btn) { btn.textContent = 'Online'; btn.classList.add('ok'); }
+        if (b) {
+          b.textContent = 'Checked ' + stamp() + ': robot is ONLINE. WiFi: ' + (state.wifi && state.wifi.ssid ? state.wifi.ssid : '…');
+          b.className = 'banner online';
+        }
+        setTimeout(() => { if (btn) btn.textContent = 'Check robot now'; btn.classList.remove('ok'); updateOnlineBadge(); }, 6000);
+      } else {
+        if (btn) { btn.textContent = 'Offline'; btn.classList.add('err'); }
+        if (b) {
+          b.textContent = 'Checked ' + stamp() + ': robot is OFFLINE. It cannot answer commands until its WiFi is back. If it never reconnects, re-pair it over Bluetooth with the ZOOZEE app (2.4 GHz network).';
+          b.className = 'banner';
+        }
+        setTimeout(() => { if (btn) btn.textContent = 'Check robot now'; btn.classList.remove('err'); updateOnlineBadge(); }, 8000);
+      }
+      $('ctrl-msg').textContent = st + ' (checked ' + stamp() + ')';
+      $('ctrl-msg').className = 'msg' + (/online/.test(st) ? ' ok' : '');
+      log('check result: ' + st);
+    } catch (e) {
+      if (btn) { btn.textContent = 'Check robot now'; btn.disabled = false; btn.classList.remove('checking'); }
+      $('ctrl-msg').textContent = 'check failed: ' + e.message;
+      $('ctrl-msg').className = 'msg err';
+      log('check error: ' + e.message);
+    }
   });
   const fan = $('fan-mode');
   if (fan) fan.addEventListener('change', () => {
