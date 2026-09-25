@@ -49,6 +49,18 @@ html, body {
 }
 .brand h1 { margin: 0; font-size: 22px; }
 .brand .sub { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+.ver-stamp {
+  display: inline-block;
+  margin: 10px auto 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--accent);
+  border: 1px solid var(--line);
+  background: var(--panel2);
+}
 
 #login-form label { display: block; font-size: 12px; margin: 12px 0 4px; color: var(--muted); }
 #login-form input {
