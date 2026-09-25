@@ -43,6 +43,7 @@ const state = {
   device: null,
   mqtt: new MqttClient(),
   mqttOk: false,
+  mqttReconnecting: false,
   maps: [],            // received map tiles: {grid, dimX, dimY, res, realX, realY}
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
   deviceId: null,
@@ -213,8 +214,20 @@ function connectMqtt(deviceId) {
     password: CFG.MQTT_PWD
   });
   m.onConnect = (errCode) => {
-    if (errCode) { log('MQTT CONNACK rc=' + errCode); setCtrlEnabled(false); return; }
+    if (errCode) {
+      log('MQTT CONNACK rc=' + errCode);
+      setCtrlEnabled(false);
+      if (store.refresh && !state.mqttReconnecting) {
+        state.mqttReconnecting = true;
+        log('token may be stale; refreshing & retrying…');
+        ensureAccess()
+          .then(() => { state.mqttReconnecting = false; connectMqtt(deviceId); })
+          .catch((e) => { state.mqttReconnecting = false; log('reconnect failed: ' + e.message); });
+      }
+      return;
+    }
     log('MQTT connected');
+    state.mqttOk = true;
     m.subscribe('device/' + deviceId + '/app', 0, () => {
       log('subscribed device/' + deviceId + '/app');
       setCtrlEnabled(true);
@@ -223,6 +236,7 @@ function connectMqtt(deviceId) {
   m.onMessage = (topic, payload, raw) => handleAppMessage(topic, payload, raw);
   m.onClose = () => {
     log('MQTT disconnected');
+    state.mqttOk = false;
     setCtrlEnabled(false);
   };
   m.onError = (e) => log('MQTT error: ' + (e && e.message ? e.message : e));

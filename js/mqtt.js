@@ -138,6 +138,11 @@
       ws.onerror = (err) => {
         if (self.onError) self.onError(err);
       };
+
+      this._connAckCb = (code) => {
+        this.connected = code === 0;
+        if (self.onConnect) self.onConnect(this.connected ? null : code);
+      };
     }
 
     _ingest(bytes) {
