@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v11';
+const APP_VER = 'v12';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -209,6 +209,11 @@ async function fetchUser() {
   log('user: ' + JSON.stringify(j).slice(0, 160));
 }
 
+function devOnline(x) {
+  return !!(x && (x.online === true || x.online === 1 || x.online === '1' ||
+    x.online === 'true' || x.is_online === true || x.device_status === 'online'));
+}
+
 async function fetchDevices() {
   await ensureAccess();
   const res = await http('/api/devices?user=' + encodeURIComponent(store.email) +
@@ -218,22 +223,24 @@ async function fetchDevices() {
   const j = jsonOk(res);
   let devs = Array.isArray(j) ? j : (j.content || j.devices || j.data || []);
   state.devices = devs;
-  const picked = devs.find(d => d.online) || devs[0] || null;
+  const picked = devs.find(devOnline) || devs[0] || null;
   state.device = picked;
   if (picked) {
     const d = picked;
     state.deviceId = d.device_id || d.id || d.sn;
     const id = state.deviceId;
-    const nOnline = devs.filter(x => x.online).length;
+    const nOnline = devs.filter(devOnline).length;
     $('dev-name').textContent = d.name || 'Jarvis';
     $('dev-sub').textContent = (d.model || '') + ' · ' + String(id || '').slice(0, 8) +
       ' · ' + (devs.length || 1) + ' dev, ' + nOnline + ' online';
+    log('raw one: ' + JSON.stringify(d).slice(0, 600));
     log('devices: ' + JSON.stringify(devs.slice(0, 8).map(x => ({
       id: String(x.device_id || x.id || x.sn || '').slice(0, 8),
-      on: !!x.online,
+      on: devOnline(x),
+      raw: !!x.online,
       seen: x.sl_last_seen || x.last_seen || null
     }))) + (devs.length > 8 ? ' …(+' + (devs.length - 8) + ')' : ''));
-    log('picked: ' + String(id || '').slice(0, 8) + (d.online ? ' (online)' : ' (offline)'));
+    log('picked: ' + String(id || '').slice(0, 8) + (devOnline(d) ? ' (online)' : ' (offline)'));
     updateOnlineBadge();
     return id;
   }
@@ -246,7 +253,7 @@ function updateOnlineBadge() {
   if (!d) return;
   const pill = $('pill-online');
   const banner = $('banner');
-  if (d.online) {
+  if (devOnline(d)) {
     pill.textContent = 'Online';
     pill.className = 'pill on';
     banner.classList.add('hidden');
@@ -373,8 +380,8 @@ async function pollDeviceStatus() {
     const j = safeJson(res.body);
     const devs = Array.isArray(j) ? j : (j && (j.content || j.devices || j.data)) || [];
     const curId = state.deviceId;
-    const d = devs.find(x => (x.device_id || x.id || x.sn) === curId && x.online) ||
-      devs.find(x => x.online) ||
+    const d = devs.find(x => (x.device_id || x.id || x.sn) === curId && devOnline(x)) ||
+      devs.find(devOnline) ||
       devs.find(x => (x.device_id || x.id || x.sn) === curId) ||
       devs[0] || null;
     if (!d) return 'robot not found in account';
@@ -383,8 +390,8 @@ async function pollDeviceStatus() {
       state.deviceId = newId;
       log('switched device to ' + String(newId).slice(0, 8) + ' (previous one offline)');
     }
-    const wasOnline = !!(state.device && state.device.online);
-    const nowOnline = !!d.online;
+    const wasOnline = !!(state.device && devOnline(state.device));
+    const nowOnline = devOnline(d);
     if (state.device) state.device = Object.assign({}, state.device, d); else state.device = d;
     updateOnlineBadge();
     if (nowOnline && !wasOnline) {
