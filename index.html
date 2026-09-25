@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Jarvis" />
+  <meta name="theme-color" content="#0f1626" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <title>Jarvis Remote</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ============================ LOGIN ============================ -->
+  <section id="screen-login" class="screen">
+    <div class="login-card">
+      <div class="brand">
+        <div class="brand-icon">J</div>
+        <h1>Jarvis Remote</h1>
+        <p class="sub">ZOOZEE Z70 / Slamtec cloud</p>
+      </div>
+      <form id="login-form" autocomplete="on">
+        <label>Email / account</label>
+        <input id="login-email" type="text" inputmode="email" autocomplete="username" placeholder="you@example.com" />
+        <label>Password</label>
+        <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" />
+        <button id="login-btn" type="submit">Sign in</button>
+      </form>
+      <p id="login-msg" class="msg"></p>
+    </div>
+  </section>
+
+  <!-- ============================ MAIN ============================ -->
+  <section id="screen-main" class="screen hidden">
+    <header class="topbar">
+      <div class="title-wrap">
+        <h2 id="dev-name">Jarvis</h2>
+        <span id="dev-sub" class="dev-sub muted">connecting…</span>
+      </div>
+      <div class="pill-row">
+        <span id="pill-online" class="pill off">Offline</span>
+        <span id="pill-battery" class="pill">–%</span>
+        <span id="pill-charge" class="pill">–</span>
+      </div>
+    </header>
+
+    <div id="banner" class="banner hidden"></div>
+
+    <main>
+      <div class="map-wrap">
+        <canvas id="map"></canvas>
+        <div id="map-status" class="map-status muted">Waiting for map…</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Status</div>
+        <div id="action-line" class="status-line">Idle</div>
+        <div id="pos-line" class="status-line muted">x: –  y: –</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Controls</div>
+        <div class="btn-grid">
+          <button class="ctrl" id="btn-sweep">Sweep all</button>
+          <button class="ctrl" id="btn-edge">Edge</button>
+          <button class="ctrl" id="btn-spot">Spot region</button>
+          <button class="ctrl warn" id="btn-stop">Stop</button>
+          <button class="ctrl" id="btn-home">Go home</button>
+          <button class="ctrl" id="btn-find">Find me</button>
+        </div>
+        <p id="ctrl-msg" class="msg"></p>
+      </div>
+
+      <div class="panel" id="schedule-panel">
+        <div class="panel-title">Schedule</div>
+        <div id="schedule-list" class="muted">…</div>
+        <div class="sched-form">
+          <input id="sched-time" type="time" />
+          <select id="sched-repeat">
+            <option value="MONDAY">Mon</option><option value="TUESDAY">Tue</option>
+            <option value="WEDNESDAY">Wed</option><option value="THURSDAY">Thu</option>
+            <option value="FRIDAY">Fri</option><option value="SATURDAY">Sat</option>
+            <option value="SUNDAY">Sun</option>
+          </select>
+          <button id="btn-add-sched">Add</button>
+        </div>
+        <p id="sched-msg" class="msg"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Account / debug</div>
+        <div id="account-line" class="status-line muted"></div>
+        <div id="log-box" class="log muted"></div>
+        <button id="btn-logout" class="ctrl ghost">Sign out</button>
+      </div>
+    </main>
+  </section>
+
+  <script src="js/rle.js"></script>
+  <script src="js/mqtt.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
