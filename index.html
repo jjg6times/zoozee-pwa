@@ -55,6 +55,11 @@
     <main>
       <div class="map-wrap">
         <canvas id="map"></canvas>
+        <div class="map-tools">
+          <button class="zoom" id="btn-zoom-in" title="Zoom in">＋</button>
+          <button class="zoom" id="btn-zoom-out" title="Zoom out">－</button>
+          <button class="zoom" id="btn-zoom-fit" title="Reset view">fit</button>
+        </div>
         <div id="map-status" class="map-status muted">Waiting for map…</div>
       </div>
 
@@ -75,6 +80,26 @@
           <button class="ctrl" id="btn-find">Find me</button>
         </div>
         <p id="ctrl-msg" class="msg"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Sweep options</div>
+        <div class="opt-row">
+          <label for="fan-mode">Suction</label>
+          <select id="fan-mode" disabled></select>
+        </div>
+        <div class="opt-row opt-check">
+          <label for="carpet-boost">Carpet boost (auto suction)</label>
+          <input id="carpet-boost" type="checkbox" disabled />
+        </div>
+        <div class="opt-row wall-row">
+          <span>No-go walls</span>
+          <button class="ctrl sm" id="btn-wall">＋ Wall</button>
+          <button class="ctrl sm" id="btn-wall-clear" disabled>Clear</button>
+          <button class="ctrl sm ok" id="btn-wall-save" disabled>Save</button>
+        </div>
+        <p id="wall-status" class="status-line muted small"></p>
+        <button class="ctrl warn ghost" id="btn-all-clear">Reset map on robot</button>
       </div>
 
       <div class="panel" id="schedule-panel">

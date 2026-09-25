@@ -131,11 +131,13 @@
       };
 
       ws.onclose = () => {
+        if (this.ws !== ws) return; // stale socket from a previous connection attempt
         this.connected = false;
         if (self.onClose) self.onClose();
       };
 
       ws.onerror = (err) => {
+        if (this.ws !== ws) return; // ignore errors from stale sockets
         if (self.onError) self.onError(err);
       };
 
