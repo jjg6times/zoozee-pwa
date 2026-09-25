@@ -71,6 +71,21 @@ html, body {
   font-size: 16px;
   font-weight: 600;
 }
+.remember-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.remember-row input {
+  width: auto;
+  accent-color: var(--accent);
+}
 
 .msg { font-size: 13px; color: var(--muted); min-height: 18px; text-align: center; margin: 8px 0 0; }
 .msg.err { color: var(--warn); }

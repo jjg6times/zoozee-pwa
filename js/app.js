@@ -27,10 +27,28 @@ const CMD = {
 const $ = (id) => document.getElementById(id);
 
 const store = {
-  get email() { return localStorage.getItem('jarvis.email'); },
-  set email(v) { if (v) localStorage.setItem('jarvis.email', v); else localStorage.removeItem('jarvis.email'); },
-  get refresh() { return localStorage.getItem('jarvis.refresh'); },
-  set refresh(v) { if (v) localStorage.setItem('jarvis.refresh', v); else localStorage.removeItem('jarvis.refresh'); }
+  get remember() { return localStorage.getItem('jarvis.remember') !== '0'; },
+  set remember(v) {
+    localStorage.setItem('jarvis.remember', v ? '1' : '0');
+    const src = v ? sessionStorage : localStorage;
+    const dst = v ? localStorage : sessionStorage;
+    for (const k of ['jarvis.email', 'jarvis.refresh']) {
+      if (src.getItem(k)) {
+        dst.setItem(k, src.getItem(k));
+        src.removeItem(k);
+      }
+    }
+  },
+  get email() { return localStorage.getItem('jarvis.email') || sessionStorage.getItem('jarvis.email'); },
+  set email(v) {
+    const s = this.remember ? localStorage : sessionStorage;
+    if (v) s.setItem('jarvis.email', v); else s.removeItem('jarvis.email');
+  },
+  get refresh() { return localStorage.getItem('jarvis.refresh') || sessionStorage.getItem('jarvis.refresh'); },
+  set refresh(v) {
+    const s = this.remember ? localStorage : sessionStorage;
+    if (v) s.setItem('jarvis.refresh', v); else s.removeItem('jarvis.refresh');
+  }
 };
 
 let access = null;
@@ -664,6 +682,7 @@ async function enterMain() {
 function init() {
   wireControls();
   setupSpot();
+  $('login-remember').checked = store.remember;
 
   $('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -677,10 +696,11 @@ function init() {
       const tok = await oauthPassword(email, password);
       access = tok.access_token;
       accessType = tok.token_type || 'Bearer';
+      store.remember = $('login-remember').checked;
       store.refresh = tok.refresh_token || null;
       store.email = email;
       expiresAt = Date.now() + ((tok.expires_in || 1800) - 60) * 1000;
-      log('login ok');
+      log('login ok' + (store.remember ? '' : ' (session only)'));
       await enterMain();
     } catch (err) {
       msg.textContent = err.message;
