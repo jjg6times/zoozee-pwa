@@ -11,6 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
+const APP_VER = 'v8';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -204,7 +205,7 @@ async function fetchUser() {
   const res = await http('/api/users?user=' + encodeURIComponent(store.email));
   const j = jsonOk(res);
   state.user = j;
-  $('account-line').textContent = 'account: ' + store.email;
+  $('account-line').textContent = 'account: ' + store.email + ' · build ' + APP_VER;
   log('user: ' + JSON.stringify(j).slice(0, 160));
 }
 
@@ -351,18 +352,18 @@ function stopStatusPoll() {
 }
 
 async function pollDeviceStatus() {
-  if (!state.deviceId || !store.email) return;
+  if (!state.deviceId || !store.email) return 'not signed in';
   try {
     await ensureAccess();
     const res = await http('/api/devices?user=' + encodeURIComponent(store.email) +
       '&with_location=true&with_owner=true&page=0&size=20', {
       headers: { 'Accept': 'application/vnd.slamtec.devicelist-v1.0+json' }
     });
-    if (!res.ok) return;
+    if (!res.ok) return 'status check failed (HTTP ' + res.status + ')';
     const j = safeJson(res.body);
     const devs = Array.isArray(j) ? j : (j && (j.content || j.devices || j.data)) || [];
     const d = devs.find(x => (x.device_id || x.id || x.sn) === state.deviceId) || devs[0] || null;
-    if (!d) return;
+    if (!d) return 'robot not found in account';
     const wasOnline = !!(state.device && state.device.online);
     const nowOnline = !!d.online;
     if (state.device) state.device = Object.assign({}, state.device, d); else state.device = d;
@@ -384,8 +385,10 @@ async function pollDeviceStatus() {
       setCtrlEnabled(false);
       state.mqttOk = false;
     }
+    return (nowOnline ? 'robot is online' : 'robot is OFFLINE') + (nowOnline && d.sl_last_seen ? '' : '');
   } catch (e) {
     log('status poll error: ' + e.message);
+    return 'status check failed (' + e.message + ')';
   }
 }
 
@@ -1093,36 +1096,46 @@ function ctrlMsg(text, isErr) {
   el.className = 'msg' + (isErr ? ' err' : ' ok');
 }
 
+function on(id, fn) { const el = $(id); if (el) el.onclick = fn; }
+function onEvent(id, ev, fn) { const el = $(id); if (el) el.addEventListener(ev, fn); }
+
 function wireControls() {
-  $('btn-sweep').onclick = () => sendCmd(CMD.SWEEP);
-  $('btn-edge').onclick = () => sendCmd(CMD.START_EDGE_SWEEPING);
-  $('btn-stop').onclick = () => sendCmd(CMD.STOP);
-  $('btn-home').onclick = () => sendCmd(CMD.GO_HOME);
-  $('btn-find').onclick = () => sendCmd(CMD.FIND_ME);
-  $('btn-spot').onclick = toggleSpot;
-  $('btn-all-clear').onclick = () => {
+  on('btn-sweep', () => sendCmd(CMD.SWEEP));
+  on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
+  on('btn-stop', () => sendCmd(CMD.STOP));
+  on('btn-home', () => sendCmd(CMD.GO_HOME));
+  on('btn-find', () => sendCmd(CMD.FIND_ME));
+  on('btn-spot', toggleSpot);
+  on('btn-all-clear', () => {
     if (window.confirm('Reset (clear) the robot mapping? This wipes the saved floor plan and starts a new map.')) {
       sendCmd(CMD.CLEAR_MAP);
     }
-  };
-  $('btn-wall').onclick = toggleWallMode;
-  $('btn-wall-save').onclick = saveWalls;
-  $('btn-wall-clear').onclick = clearWalls;
-  $('btn-zoom-in').onclick = zoomIn;
-  $('btn-zoom-out').onclick = zoomOut;
-  $('btn-zoom-fit').onclick = resetView;
-  $('btn-add-sched').onclick = addSchedule;
-  $('btn-logout').onclick = logout;
-  $('sched-time').addEventListener('change', () => $('sched-msg').textContent = '');
-  $('carpet-boost').addEventListener('change', (e) => toggleCarpetBoost(!!e.target.checked));
-  $('btn-check-now').onclick = () => {
+  });
+  on('btn-wall', toggleWallMode);
+  on('btn-wall-save', saveWalls);
+  on('btn-wall-clear', clearWalls);
+  on('btn-zoom-in', zoomIn);
+  on('btn-zoom-out', zoomOut);
+  on('btn-zoom-fit', resetView);
+  on('btn-add-sched', addSchedule);
+  on('btn-logout', logout);
+  onEvent('sched-time', 'change', () => $('sched-msg').textContent = '');
+  onEvent('carpet-boost', 'change', (e) => toggleCarpetBoost(!!e.target.checked));
+  on('btn-check-now', async () => {
+    const btn = $('btn-check-now');
+    const oldTxt = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = 'Checking…'; btn.disabled = true; }
     $('ctrl-msg').textContent = 'checking robot…';
     $('ctrl-msg').className = 'msg';
     requestNetworkInfo();
-    pollDeviceStatus();
-  };
+    const st = await pollDeviceStatus();
+    if (btn) { btn.textContent = oldTxt; btn.disabled = false; }
+    $('ctrl-msg').textContent = st;
+    $('ctrl-msg').className = st.indexOf('online') >= 0 ? 'msg ok' : 'msg';
+    log('check result: ' + st);
+  });
   const fan = $('fan-mode');
-  fan.addEventListener('change', () => {
+  if (fan) fan.addEventListener('change', () => {
     if (fan.value !== '') sendFanMode(parseInt(fan.value, 10));
   });
 }
@@ -1230,6 +1243,12 @@ function init() {
   setupMap();
   setWallBank();
   renderWifi();
+  log('build ' + APP_VER);
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js')
+      .then(() => log('service worker ready'))
+      .catch((e) => log('service worker failed: ' + e.message));
+  }
   $('login-remember').checked = store.remember;
 
   $('login-form').addEventListener('submit', async (e) => {
