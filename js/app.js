@@ -17,13 +17,13 @@ const TYPE = {
   ENTIRE_EXPLORE_MAP: 17, ENTIRE_SWEEP_MAP: 18, ROBOTTRACK: 19,
   SWEEP_AREA: 20, DOCK_POSE: 21, ROBOT_STATUS: 22,
   SWEEP_REGION: 28, SWEEPING_REGION: 29, SWEEP_TIME: 12,
-  SWEEP_FAN_MODE: 25, SMART_PRESSURIZATION: 58
+  SWEEP_FAN_MODE: 25, SMART_PRESSURIZATION: 58, NETWORK_INFO: 24
 };
 const CMD = {
   STOP: 24, GO_HOME: 25, SWEEP: 26, SWEEP_SPOT: 27, CLEAR_MAP: 54, FIND_ME: 56,
   START_SWEEP_REGION: 68, START_AUTO_EXPLORING: 108, START_EDGE_SWEEPING: 109,
   UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
-  GET_SMART_PRESSURIZATION: 83
+  GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -78,6 +78,13 @@ let access = null;
 let accessType = 'Bearer';
 let expiresAt = 0;
 
+function loadLastWifi() {
+  try { return JSON.parse(localStorage.getItem('jarvis.wifi') || 'null'); } catch (e) { return null; }
+}
+function saveLastWifi(w) {
+  try { localStorage.setItem('jarvis.wifi', JSON.stringify(w)); } catch (e) { /* noop */ }
+}
+
 const state = {
   user: null,
   devices: [],
@@ -102,6 +109,9 @@ const state = {
   wallMode: false,
   wallDirty: false,
   dock: null,          // {x,y,yaw} dock/charging pose
+  wifi: null,          // live network info {ssid, ip, mac}
+  wifiTs: 0,
+  lastContact: 0,      // last time any robot message was received (ms)
   fanMode: null,
   carpetBoost: null,   // smart pressurization (auto boost on carpet)
   area: null,          // cleaned area m2
@@ -300,6 +310,7 @@ function connectMqtt(deviceId) {
       setCtrlEnabled(true);
       requestFanMode();
       requestSmartPress();
+      requestNetworkInfo();
     });
   };
   m.onMessage = (topic, payload, raw) => handleAppMessage(topic, payload, raw);
@@ -364,6 +375,9 @@ async function pollDeviceStatus() {
       } else {
         state.mqttOk = true;
         setCtrlEnabled(true);
+        requestFanMode();
+        requestSmartPress();
+        requestNetworkInfo();
       }
     }
     if (!nowOnline && state.mqttOk) {
@@ -410,6 +424,33 @@ function sendFanMode(value) {
 function requestSmartPress() {
   sendCmd(CMD.GET_SMART_PRESSURIZATION, { messageId: '' });
 }
+function requestNetworkInfo() {
+  sendCmd(CMD.NETWORK_INFO);
+}
+function renderWifi() {
+  const el = $('wifi-line');
+  if (!el) return;
+  const w = state.wifi;
+  const last = state.lastContact;
+  let txt;
+  if (w) {
+    txt = (w.ssid ? 'WiFi: ' + w.ssid : 'WiFi: —') + (w.ip ? ' · IP ' + w.ip : '') +
+      (w.mac ? ' · ' + w.mac.slice(-6).toUpperCase() : '');
+  } else {
+    const lw = loadLastWifi();
+    txt = lw && lw.ssid
+      ? 'WiFi (last known): ' + lw.ssid + ' · ' + (lw.ip || 'no IP')
+      : 'WiFi: — (robot offline)';
+  }
+  if (last) txt += ' · live ' + ago(last);
+  el.textContent = txt;
+}
+function ago(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  return m + 'm';
+}
 function toggleCarpetBoost(value) {
   const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
   sendCmd(CMD.GET_SMART_PRESSURIZATION, { messageId: id, value });
@@ -429,6 +470,7 @@ function pingLoop() {
       m.ping();
       lastPing = Date.now();
     }
+    renderWifi();
   }, 10000);
 }
 
@@ -441,6 +483,8 @@ function handleAppMessage(topic, payload, raw) {
   }
   const f = env.f;
   const p = env.p;
+  state.lastContact = Date.now();
+  renderWifi();
   switch (f) {
     case TYPE.POSE:
       state.pose = { x: num(p.x), y: num(p.y), yaw: num(p.yaw) };
@@ -499,6 +543,19 @@ function handleAppMessage(topic, payload, raw) {
         state.carpetBoost = !!p.value;
         const cb = $('carpet-boost');
         if (cb) cb.checked = state.carpetBoost;
+      }
+      break;
+    case TYPE.NETWORK_INFO:
+      if (p && typeof p === 'object') {
+        state.wifi = {
+          ssid: p.ssid !== undefined ? String(p.ssid) : null,
+          ip: p.ip !== undefined ? String(p.ip) : null,
+          mac: p.mac !== undefined ? String(p.mac) : null
+        };
+        state.wifiTs = Date.now();
+        saveLastWifi(state.wifi);
+        log('network: ssid=' + state.wifi.ssid + ' ip=' + state.wifi.ip);
+        renderWifi();
       }
       break;
     case TYPE.EXPLORE_MAP:
@@ -1058,6 +1115,12 @@ function wireControls() {
   $('btn-logout').onclick = logout;
   $('sched-time').addEventListener('change', () => $('sched-msg').textContent = '');
   $('carpet-boost').addEventListener('change', (e) => toggleCarpetBoost(!!e.target.checked));
+  $('btn-check-now').onclick = () => {
+    $('ctrl-msg').textContent = 'checking robot…';
+    $('ctrl-msg').className = 'msg';
+    requestNetworkInfo();
+    pollDeviceStatus();
+  };
   const fan = $('fan-mode');
   fan.addEventListener('change', () => {
     if (fan.value !== '') sendFanMode(parseInt(fan.value, 10));
@@ -1085,6 +1148,10 @@ function clearState() {
   state.carpetBoost = null;
   const cbEl = $('carpet-boost');
   if (cbEl) cbEl.checked = false;
+  state.wifi = null;
+  state.wifiTs = 0;
+  state.lastContact = 0;
+  renderWifi();
   state.walls = [];
   state.wallDirty = false;
   state.wallMode = false;
@@ -1162,6 +1229,7 @@ function init() {
   wireControls();
   setupMap();
   setWallBank();
+  renderWifi();
   $('login-remember').checked = store.remember;
 
   $('login-form').addEventListener('submit', async (e) => {
