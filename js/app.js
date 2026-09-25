@@ -143,7 +143,7 @@ async function fetchDevices() {
     headers: { 'Accept': 'application/vnd.slamtec.devicelist-v1.0+json' }
   });
   const j = jsonOk(res);
-  let devs = Array.isArray(j) ? j : (j.devices || j.data || []);
+  let devs = Array.isArray(j) ? j : (j.content || j.devices || j.data || []);
   state.devices = devs;
   state.device = devs[0] || null;
   if (state.device) {
@@ -515,7 +515,7 @@ async function refreshSchedules() {
     });
     if (!res.ok) { listEl.textContent = 'HTTP ' + res.status; return; }
     const j = JSON.parse(res.body);
-    const items = Array.isArray(j) ? j : (j.scheduled_tasks || j.data || []);
+    const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
     if (!items.length) { listEl.textContent = 'No scheduled tasks'; return; }
     listEl.innerHTML = '';
     for (const it of items) {
