@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v20';
+const APP_VER = 'v21';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -24,7 +24,7 @@ const CMD = {
   STOP: 24, GO_HOME: 25, SWEEP: 26, SWEEP_SPOT: 27, CLEAR_MAP: 54, FIND_ME: 56,
   START_SWEEP_REGION: 68, START_AUTO_EXPLORING: 108, START_EDGE_SWEEPING: 109,
   UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
-  GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57
+  GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -319,6 +319,7 @@ function sendProbes() {
   requestFanMode();
   requestSmartPress();
   requestNetworkInfo();
+  requestEntireMap();
 }
 
 function handleReach() {
@@ -528,6 +529,9 @@ function requestSmartPress() {
 }
 function requestNetworkInfo() {
   sendCmd(CMD.NETWORK_INFO);
+}
+function requestEntireMap() {
+  sendCmd(CMD.ENTIRE_MAP);
 }
 function renderWifi() {
   const el = $('wifi-line');
