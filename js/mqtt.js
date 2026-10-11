@@ -84,10 +84,12 @@
     return arr;
   }
 
-  function concat(a, b) {
-    const out = new Uint8Array(a.length + b.length);
-    out.set(a, 0);
-    out.set(b, a.length);
+  function concat() {
+    let total = 0;
+    for (let i = 0; i < arguments.length; i++) total += arguments[i].length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (let i = 0; i < arguments.length; i++) { out.set(arguments[i], off); off += arguments[i].length; }
     return out;
   }
 
