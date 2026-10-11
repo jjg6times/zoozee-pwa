@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v13';
+const APP_VER = 'v14';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -1137,6 +1137,26 @@ function ctrlMsg(text, isErr) {
   el.className = 'msg' + (isErr ? ' err' : ' ok');
 }
 
+async function copyDiag() {
+  const g = (id) => { const el = $(id); return el ? el.textContent : '?'; };
+  const parts = [
+    'build ' + APP_VER,
+    'status: ' + g('pill-online'),
+    'dev: ' + g('dev-sub'),
+    'action: ' + g('action-line'),
+    'wifi: ' + g('wifi-line'),
+    'banner: ' + (g('banner') || '').slice(0, 200),
+    '--- log ---',
+    g('log-box')
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(parts);
+    ctrlMsg('diagnostics copied — paste it to me', false);
+  } catch (e) {
+    ctrlMsg('copy failed: ' + e.message, true);
+  }
+}
+
 function on(id, fn) { const el = $(id); if (el) el.onclick = fn; }
 function onEvent(id, ev, fn) { const el = $(id); if (el) el.addEventListener(ev, fn); }
 
@@ -1160,6 +1180,7 @@ function wireControls() {
   on('btn-zoom-fit', resetView);
   on('btn-add-sched', addSchedule);
   on('btn-logout', logout);
+  on('btn-copy-log', copyDiag);
   onEvent('sched-time', 'change', () => $('sched-msg').textContent = '');
   onEvent('carpet-boost', 'change', (e) => toggleCarpetBoost(!!e.target.checked));
   on('btn-check-now', async () => {
