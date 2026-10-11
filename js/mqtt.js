@@ -172,8 +172,7 @@
         case 2: // CONNACK: body = [sessionPresent, returnCode]
           if (this._connAckCb) {
             const code = body.length >= 2 ? body[1] : 0xff;
-            this.connected = code === 0;
-            this._connAckCb(this.connected ? null : code);
+            this._connAckCb(code);
           }
           break;
         case 3: { // PUBLISH
