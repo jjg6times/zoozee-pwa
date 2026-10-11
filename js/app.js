@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v12';
+const APP_VER = 'v13';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -261,9 +261,10 @@ function updateOnlineBadge() {
     pill.textContent = 'Offline';
     pill.className = 'pill off';
     const nDev = state.devices && state.devices.length;
-    banner.textContent = 'Robot is offline (last seen ' + (d.sl_last_seen || d.last_seen || '?') +
+    const txt = 'Robot is offline (last seen ' + (d.sl_last_seen || d.last_seen || '?') +
       '). Switch it on and connect it to WiFi, then press "Check robot now".' +
       (nDev > 1 ? ' Your account has ' + nDev + ' robot entries; the app auto-picks the online one.' : '');
+    if (banner.textContent !== txt) banner.textContent = txt;
     banner.classList.remove('hidden');
   }
 }
@@ -303,9 +304,18 @@ function renderStatus() {
 }
 
 /* ================= MQTT ================= */
+let mqttConnTimer = null;
 function connectMqtt(deviceId) {
   const m = state.mqtt;
   state.mqttConnecting = true;
+  clearTimeout(mqttConnTimer);
+  mqttConnTimer = setTimeout(() => {
+    state.mqttConnecting = false;
+    if (!m.connected && state.device && devOnline(state.device)) {
+      log('mqtt connect timed out');
+      scheduleReconnect('connect timed out', false);
+    }
+  }, 15000);
   m.connect(CFG.WS, {
     clientId: access,
     username: access,
@@ -313,6 +323,7 @@ function connectMqtt(deviceId) {
   });
   m.onConnect = (errCode) => {
     state.mqttConnecting = false;
+    clearTimeout(mqttConnTimer);
     if (errCode) {
       log('MQTT CONNACK rc=' + errCode);
       setCtrlEnabled(false);
@@ -323,9 +334,10 @@ function connectMqtt(deviceId) {
     state.retry.delay = 2000;
     log('MQTT connected');
     state.mqttOk = true;
+    lastPing = Date.now();
     m.subscribe('device/' + deviceId + '/app', 0, () => {
       log('subscribed device/' + deviceId + '/app');
-      setCtrlEnabled(true);
+      setCtrlEnabled(devOnline(state.device));
       requestFanMode();
       requestSmartPress();
       requestNetworkInfo();
@@ -334,10 +346,11 @@ function connectMqtt(deviceId) {
   m.onMessage = (topic, payload, raw) => handleAppMessage(topic, payload, raw);
   m.onClose = () => {
     state.mqttConnecting = false;
+    clearTimeout(mqttConnTimer);
     log('MQTT disconnected');
     state.mqttOk = false;
     setCtrlEnabled(false);
-    if (state.device && state.device.online) scheduleReconnect('connection dropped', false);
+    if (state.device && devOnline(state.device)) scheduleReconnect('connection dropped', false);
   };
   m.onError = (e) => log('MQTT error: ' + (e && e.message ? e.message : e));
 }
@@ -345,7 +358,7 @@ function connectMqtt(deviceId) {
 function scheduleReconnect(reason, useRefresh) {
   if (state.mqttReconnecting) return;
   if (!store.refresh) return;
-  if (!state.device || !state.device.online) { log('no reconnect: device offline'); return; }
+  if (!state.device || !devOnline(state.device)) { log('no reconnect: device offline'); return; }
   state.mqttReconnecting = true;
   const delay = state.retry.delay;
   clearTimeout(state.retry.timer);
@@ -492,8 +505,10 @@ function strToBytes(s) {
 }
 
 let lastPing = 0;
+let pingTimer = null;
 function pingLoop() {
-  setInterval(() => {
+  if (pingTimer) return;
+  pingTimer = setInterval(() => {
     const m = state.mqtt;
     if (m.connected && Date.now() - lastPing > 20000) {
       m.ping();
@@ -1198,6 +1213,9 @@ function clearState() {
   state.worldBounds = null;
   state.pose = null;
   state.action = null;
+  state.device = null;
+  state.devices = [];
+  state.deviceId = null;
   state.battery = null;
   state.charging = null;
   state.status = null;
@@ -1218,10 +1236,16 @@ function clearState() {
   state.spot = false;
   state.spotCur = null;
   state.view = { scale: 0, ox: 0, oy: 0, fit: true };
+  const sp = $('btn-spot');
+  if (sp) sp.textContent = 'Spot region';
+  const wb = $('btn-wall');
+  if (wb) { wb.textContent = '＋ Wall'; wb.classList.remove('active'); }
 }
 
 function logout() {
   stopStatusPoll();
+  if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  clearTimeout(mqttConnTimer);
   state.mqtt.disconnect();
   state.mqttOk = false;
   clearTimeout(state.retry.timer);
@@ -1229,6 +1253,7 @@ function logout() {
   store.email = null;
   access = null;
   clearState();
+  setCtrlEnabled(false);
   const fan = $('fan-mode');
   if (fan) fan.innerHTML = '<option value="" disabled>—</option>';
   show('screen-login');
@@ -1262,7 +1287,11 @@ async function enterMain() {
   try {
     await fetchUser();
     const deviceId = await fetchDevices();
-    connectMqtt(deviceId);
+    if (devOnline(state.device)) {
+      connectMqtt(deviceId);
+    } else {
+      log('robot offline — waiting for it to come back');
+    }
     pingLoop();
     startStatusPoll();
     refreshSchedules();

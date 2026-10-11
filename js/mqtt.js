@@ -56,7 +56,7 @@
   function buildSubscribe(msgId, topic, qos) {
     const t = stringBytes(topic);
     const payload = concat(
-      [0x00, msgId & 0xff],
+      [(msgId >> 8) & 0xff, msgId & 0xff],
       [(t.length >> 8) & 0xff, t.length & 0xff],
       t,
       [qos & 0x03]
@@ -68,7 +68,7 @@
     const t = stringBytes(topic);
     const body = concat(
       concat([(t.length >> 8) & 0xff, t.length & 0xff], t),
-      msgId != null ? [0x00, msgId & 0xff] : [],
+      msgId != null ? [(msgId >> 8) & 0xff, msgId & 0xff] : [],
       payload
     );
     return concat([0x30], concat(encodeLen(body.length), body));
@@ -193,7 +193,9 @@
 
     subscribe(topic, qos, cb) {
       this._subAckCb = cb || null;
-      this._send(buildSubscribe(this.msgId++, topic, qos || 0));
+      const id = this.msgId;
+      this.msgId = (id >= 0xfffe) ? 1 : id + 1;
+      this._send(buildSubscribe(id, topic, qos || 0));
     }
 
     publish(topic, payload, msgId) {

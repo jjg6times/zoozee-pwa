@@ -1,4 +1,4 @@
-const CACHE = 'jarvis-remote-v12';
+const CACHE = 'jarvis-remote-v13';
 const ASSETS = [
   './',
   './index.html',
@@ -19,7 +19,11 @@ self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
-    ).then(() => self.clients.claim())
+    ).then(() => self.clients.claim()).then(async () => {
+      // New SW version: hard-reload open pages so users don't sit on old code.
+      const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      return Promise.all(wins.map((c) => c.navigate(c.url).catch(() => null)));
+    })
   );
 });
 
