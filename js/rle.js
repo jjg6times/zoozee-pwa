@@ -3,6 +3,8 @@
   'use strict';
 
   // data: Uint8Array of the base64-decoded map_data. Returns Uint8Array grid.
+  // Faithful port of RLEUtil.kt (o5/i.java), verified against live robot maps:
+  //   full map 131x149 -> len field 19519 = 131*149; tile 54x80 -> 4320 = 54*80.
   function decodeRLE(data) {
     if (!data || data.length < 9) return null;
     if (String.fromCharCode(data[0], data[1], data[2]) !== 'RLE') return null;
@@ -11,47 +13,43 @@
     let prev = data[4];         // prev byte
     let pos = 5;
     let outLen = 0;
-    // Decompressed length is a 4-byte LITTLE-ENDIAN integer
-    // (verified against the robot: e0 10 00 00 -> 4320 = 54*80).
-    for (let k = 0; k < 4; k++) { outLen |= (data[pos++] & 255) << (8 * k); }
+    // Decompressed length is a 4-byte LITTLE-ENDIAN integer, and is used as the
+    // output cap (the token stream may encode a little more than one map).
+    for (let k = 0; k < 4; k++) { outLen += (data[pos++] & 255) * (2 ** (8 * k)); }
     if (outLen < 0 || outLen > 50e6) return null; // sanity guard
 
     const out = new Uint8Array(outLen);
     let oi = 0;
+    const n = data.length;
 
-    while (pos < data.length) {
+    while (pos < n) {
+      let i13 = pos + 1;
       let b12 = data[pos];
-      let count = 1;
+      let j12 = 1;
       if (b12 === marker) {
-        // marker byte encountered
-        if (data[pos + 1] === 0) {
-          // escape: marker followed by 0 -> next byte is a literal marker value
-          pos += 2;
-          if (prev === data[pos]) {
-            // literal equals prev byte: swap meaning of marker/prev
-            pos += 1;
-            const tmp = prev;
+        if (i13 >= n) break;
+        if (data[i13] === 0) {
+          // escape: marker followed by 0 -> next byte decides marker/prev swap
+          i13++;
+          if (i13 >= n) break;
+          if (prev === data[i13]) {
             prev = marker;
-            marker = data[pos - 1];
-            b12 = tmp;
-          } else {
-            b12 = data[pos];
-            pos += 1;
-            count = 1;
+            marker = data[i13];
           }
         } else {
           // normal run: marker, count, value
-          count = data[pos + 1] & 255;
-          b12 = data[pos + 2];
-          pos += 3;
+          const i14 = i13 + 1;
+          if (i14 >= n) break;
+          j12 = data[i13] & 255;
+          i13 = i14 + 1;
+          b12 = data[i14];
         }
-      } else {
-        pos += 1;
       }
-      while (count > 0 && oi < outLen) {
+      while (j12 > 0 && oi < outLen) {
         out[oi++] = b12;
-        count--;
+        j12--;
       }
+      pos = i13;
     }
     return out;
   }

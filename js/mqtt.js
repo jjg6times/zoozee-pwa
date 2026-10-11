@@ -75,7 +75,7 @@
   }
 
   function buildPing() {
-    return [0xc0, 0x00];
+    return new Uint8Array([0xc0, 0x00]);
   }
 
   function stringBytes(s) {
@@ -191,7 +191,9 @@
     }
 
     _send(bytes) {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(bytes);
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (!(bytes instanceof Uint8Array) && !(bytes instanceof ArrayBuffer)) bytes = new Uint8Array(bytes);
+      this.ws.send(bytes);
     }
 
     subscribe(topic, qos, cb) {
