@@ -11,7 +11,10 @@
     let prev = data[4];         // prev byte
     let pos = 5;
     let outLen = 0;
-    for (let k = 0; k < 4; k++) { outLen = (outLen << 8) | (data[pos++] & 255); }
+    // Decompressed length is a 4-byte LITTLE-ENDIAN integer
+    // (verified against the robot: e0 10 00 00 -> 4320 = 54*80).
+    for (let k = 0; k < 4; k++) { outLen |= (data[pos++] & 255) << (8 * k); }
+    if (outLen < 0 || outLen > 50e6) return null; // sanity guard
 
     const out = new Uint8Array(outLen);
     let oi = 0;

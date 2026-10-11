@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v19';
+const APP_VER = 'v20';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -45,6 +45,19 @@ const ACTION_LABELS = {
   SWEEPING_REGION: 'Region sweep…', SWEEP_REGION: 'Region sweep',
   PAUSE: 'Paused', PAUSED: 'Paused',
   RETURN: 'Returning home', RETURNING: 'Returning home', CHARGING: 'Charging', CHARGING_PAUSED: 'Charging (paused)'
+};
+/* The Z70 firmware sends NUMERIC codes (verified live, 2026):
+   CURRENT_ACTION.an -> 0 exploring/edge, 3 go-home, 4 sweep, 5 spot
+   ROBOT_STATUS.p    -> 0 idle, 5 returning, 6 sweeping, 11 spot, 20 mapping, 22 edge */
+const ACTION_NUM = {
+  0: 'Exploring', 1: 'Returning home', 3: 'Returning home',
+  4: 'Sweeping', 5: 'Spot cleaning', 6: 'Edge sweeping'
+};
+const STATUS_LABELS = {
+  0: 'Idle', 1: 'Idle', 2: 'Charging', 3: 'Charging', 4: 'Charge complete',
+  5: 'Returning to dock', 6: 'Sweeping', 7: 'Paused', 8: 'Paused', 9: 'Docking',
+  10: 'Charging', 11: 'Spot cleaning', 12: 'Spot cleaning', 13: 'Recharging',
+  20: 'Mapping', 21: 'Docked', 22: 'Edge sweeping'
 };
 
 /* ================= state ================= */
@@ -103,6 +116,7 @@ const state = {
   battery: null,
   charging: null,
   status: null,
+  statusText: '',
   spot: false,
   spotStart: null,
   spotCur: null,
@@ -331,13 +345,12 @@ function renderStatus() {
     pillC.style.display = '';
   }
   const act = state.action;
-  const statusTxt = state.status && state.status.text ? String(state.status.text) : '';
   let actionTxt = '';
-  if (act && act.an) {
-    actionTxt = (ACTION_LABELS[act.an] || act.an) + (act.st !== undefined && act.st !== null ? ' (' + act.st + ')' : '');
-    if (statusTxt) actionTxt += ' · ' + statusTxt;
-  } else if (statusTxt) {
-    actionTxt = statusTxt;
+  if (state.statusText) {
+    actionTxt = state.statusText;
+  } else if (act && act.an !== undefined && act.an !== null) {
+    const name = ACTION_NUM[act.an] || ACTION_LABELS[act.an] || ('Action ' + act.an);
+    actionTxt = name + (act.st !== undefined && act.st !== null ? ' (' + act.st + ')' : '');
   } else {
     actionTxt = 'Idle';
   }
@@ -598,9 +611,12 @@ function handleAppMessage(topic, payload, raw) {
       break;
     case TYPE.ROBOT_STATUS:
       state.status = null;
-      if (typeof p === 'object') {
+      if (typeof p === 'number') {
+        state.statusText = STATUS_LABELS[p] || ('Working (' + p + ')');
+      } else if (p && typeof p === 'object') {
         state.status = p;
-        if (p.state !== undefined) state.status.text = String(p.state);
+        const t = p.state !== undefined ? p.state : (p.text !== undefined ? p.text : p.status);
+        state.statusText = (t === undefined || t === null || t === '') ? '' : (STATUS_LABELS[t] || String(t));
       }
       renderStatus();
       break;
@@ -1208,6 +1224,22 @@ async function copyDiag() {
 function on(id, fn) { const el = $(id); if (el) el.onclick = fn; }
 function onEvent(id, ev, fn) { const el = $(id); if (el) el.addEventListener(ev, fn); }
 
+function pulseBtn(el) {
+  if (!el) return;
+  el.classList.remove('pressed');
+  void el.offsetWidth; // restart animation
+  el.classList.add('pressed');
+  clearTimeout(el._pulseT);
+  el._pulseT = setTimeout(() => el.classList.remove('pressed'), 260);
+  if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) { /* noop */ } }
+}
+function wirePressFeedback() {
+  document.querySelectorAll('.ctrl, .zoom, #login-btn').forEach(b => {
+    b.addEventListener('pointerdown', () => pulseBtn(b));
+    b.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') pulseBtn(b); });
+  });
+}
+
 function wireControls() {
   on('btn-sweep', () => sendCmd(CMD.SWEEP));
   on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
@@ -1298,6 +1330,7 @@ function clearState() {
   state.battery = null;
   state.charging = null;
   state.status = null;
+  state.statusText = '';
   state.dock = null;
   state.area = null;
   state.sweepTime = null;
@@ -1395,6 +1428,7 @@ function populateFanOptions() {
 
 function init() {
   wireControls();
+  wirePressFeedback();
   setupMap();
   setWallBank();
   renderWifi();
