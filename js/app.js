@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v15';
+const APP_VER = 'v16';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -120,7 +120,7 @@ const state = {
   area: null,          // cleaned area m2
   sweepTime: null,     // seconds
   view: { scale: 0, ox: 0, oy: 0, fit: true }, // px-per-meter + origin offset (CSS px)
-  retry: { timer: null, delay: 2000 },
+  retry: { timer: null, delay: 2000, burst: 0 },
   logCount: 0
 };
 
@@ -354,6 +354,7 @@ function renderStatus() {
 
 /* ================= MQTT ================= */
 let mqttConnTimer = null;
+let lastConnectTs = 0;
 function connectMqtt(deviceId) {
   const m = state.mqtt;
   state.mqttConnecting = true;
@@ -380,9 +381,10 @@ function connectMqtt(deviceId) {
       return;
     }
     state.mqttReconnecting = false;
-    state.retry.delay = 2000;
     log('MQTT connected');
     state.mqttOk = true;
+    state.retry.burst = 0;
+    lastConnectTs = Date.now();
     lastPing = Date.now();
     updateBadgeState(null);
     m.subscribe('device/' + deviceId + '/app', 0, () => {
@@ -400,6 +402,9 @@ function connectMqtt(deviceId) {
     setCtrlEnabled(false);
     state.ctrlEnabled = false;
     updateBadgeState(false);
+    const up = Date.now() - lastConnectTs;
+    state.retry.burst = (up > 30000) ? 0 : state.retry.burst + 1;
+    if (up > 30000) state.retry.delay = 2000;
     scheduleReconnect('connection dropped', false);
   };
   m.onError = (e) => log('MQTT error: ' + (e && e.message ? e.message : e));
@@ -409,6 +414,10 @@ function scheduleReconnect(reason, useRefresh) {
   if (state.mqttReconnecting) return;
   if (!store.refresh) return;
   if (!state.device) return;
+  if (state.retry.burst >= 6) {
+    log('mqtt keeps getting dropped — backing off until next poll/check');
+    return;
+  }
   state.mqttReconnecting = true;
   const delay = state.retry.delay;
   clearTimeout(state.retry.timer);
