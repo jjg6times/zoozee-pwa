@@ -112,6 +112,7 @@
       this.onMessage = null;
       this.onClose = null;
       this.onError = null;
+      this.onOpen = null;
     }
 
     connect(url, opts) {
@@ -122,6 +123,7 @@
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
+        if (self.onOpen) self.onOpen();
         ws.send(buildConnect(opts));
       };
 
@@ -130,10 +132,10 @@
         this._ingest(data);
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         if (this.ws !== ws) return; // stale socket from a previous connection attempt
         this.connected = false;
-        if (self.onClose) self.onClose();
+        if (self.onClose) self.onClose(ev);
       };
 
       ws.onerror = (err) => {
@@ -165,9 +167,9 @@
 
     _handle(type, body) {
       switch (type) {
-        case 2: // CONNACK
+        case 2: // CONNACK: body = [sessionPresent, returnCode]
           if (this._connAckCb) {
-            const code = body.length > 2 ? body[2] : body[1] || 0xff;
+            const code = body.length >= 2 ? body[1] : 0xff;
             this.connected = code === 0;
             this._connAckCb(this.connected ? null : code);
           }

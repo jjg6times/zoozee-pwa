@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v16';
+const APP_VER = 'v17';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -394,15 +394,16 @@ function connectMqtt(deviceId) {
     });
   };
   m.onMessage = (topic, payload, raw) => handleAppMessage(topic, payload, raw);
-  m.onClose = () => {
+  m.onOpen = () => log('WS open — sent CONNECT');
+  m.onClose = (ev) => {
     state.mqttConnecting = false;
     clearTimeout(mqttConnTimer);
-    log('MQTT disconnected');
+    log('MQTT disconnected' + (ev ? ' code=' + ev.code + (ev.reason ? ' ' + ev.reason : '') : ''));
     state.mqttOk = false;
     setCtrlEnabled(false);
     state.ctrlEnabled = false;
     updateBadgeState(false);
-    const up = Date.now() - lastConnectTs;
+    const up = lastConnectTs ? (Date.now() - lastConnectTs) : 0;
     state.retry.burst = (up > 30000) ? 0 : state.retry.burst + 1;
     if (up > 30000) state.retry.delay = 2000;
     scheduleReconnect('connection dropped', false);
