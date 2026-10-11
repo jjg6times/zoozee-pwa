@@ -1,4 +1,4 @@
-const CACHE = 'jarvis-remote-v22';
+const CACHE = 'jarvis-remote-v23';
 const ASSETS = [
   './',
   './index.html',
@@ -12,7 +12,16 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(
+    caches.open(CACHE).then(async (c) => {
+      // Bypass the HTTP cache so a new SW version always grabs fresh files
+      // (prevents mixed old/new code when the CDN updates files at different times).
+      for (const u of ASSETS) {
+        const res = await fetch(new Request(u, { cache: 'reload' }));
+        await c.put(u, res);
+      }
+    }).then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (e) => {
