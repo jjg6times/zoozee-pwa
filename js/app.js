@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v14';
+const APP_VER = 'v15';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -113,6 +113,8 @@ const state = {
   wifi: null,          // live network info {ssid, ip, mac}
   wifiTs: 0,
   lastContact: 0,      // last time any robot message was received (ms)
+  reachable: false,    // robot answered an MQTT probe or sent traffic recently
+  ctrlEnabled: false,
   fanMode: null,
   carpetBoost: null,   // smart pressurization (auto boost on carpet)
   area: null,          // cleaned area m2
@@ -240,33 +242,80 @@ async function fetchDevices() {
       raw: !!x.online,
       seen: x.sl_last_seen || x.last_seen || null
     }))) + (devs.length > 8 ? ' …(+' + (devs.length - 8) + ')' : ''));
-    log('picked: ' + String(id || '').slice(0, 8) + (devOnline(d) ? ' (online)' : ' (offline)'));
-    updateOnlineBadge();
+    log('picked: ' + String(id || '').slice(0, 8) + (devOnline(d) ? ' (cloud-listed online)' : ' (cloud has no online flag)'));
+    updateBadgeState(null);
     return id;
   }
   throw new Error('No robot found on this account');
 }
 
 /* ================= status UI ================= */
-function updateOnlineBadge() {
-  const d = state.device;
-  if (!d) return;
+function updateBadgeState(online) {
   const pill = $('pill-online');
   const banner = $('banner');
-  if (devOnline(d)) {
+  if (!pill || !banner) return;
+  if (online) {
     pill.textContent = 'Online';
     pill.className = 'pill on';
     banner.classList.add('hidden');
+  } else if (online === null) {
+    pill.textContent = 'Contacting…';
+    pill.className = 'pill';
+    banner.textContent = 'Cloud link OK — asking the robot to reply…';
+    banner.classList.remove('hidden');
   } else {
     pill.textContent = 'Offline';
     pill.className = 'pill off';
-    const nDev = state.devices && state.devices.length;
-    const txt = 'Robot is offline (last seen ' + (d.sl_last_seen || d.last_seen || '?') +
-      '). Switch it on and connect it to WiFi, then press "Check robot now".' +
-      (nDev > 1 ? ' Your account has ' + nDev + ' robot entries; the app auto-picks the online one.' : '');
+    const last = state.lastContact ? ' Last live: ' + ago(state.lastContact) + ' ago.' : '';
+    const txt = 'Robot is offline' + last + ' Power it on, make sure its 2.4 GHz WiFi is working, then press "Check robot now".';
     if (banner.textContent !== txt) banner.textContent = txt;
     banner.classList.remove('hidden');
   }
+}
+
+let reachTimer = null;
+let reachWaitResolve = null;
+
+function clearReachTimer() {
+  if (reachTimer) { clearTimeout(reachTimer); reachTimer = null; }
+}
+
+function armReachProbe(ms) {
+  clearReachTimer();
+  reachTimer = setTimeout(() => {
+    reachTimer = null;
+    if (state.reachable) return;
+    log('no reply in ' + Math.round(ms / 1000) + 's — robot did not answer');
+    setCtrlEnabled(false);
+    state.ctrlEnabled = false;
+    updateBadgeState(false);
+  }, ms);
+}
+
+function waitReach(ms) {
+  clearReachTimer();
+  return new Promise((resolve) => {
+    const to = setTimeout(() => { reachWaitResolve = null; resolve(state.reachable); }, ms);
+    reachWaitResolve = (ok) => { clearTimeout(to); reachWaitResolve = null; resolve(ok); };
+  });
+}
+
+function sendProbes() {
+  if (!state.mqtt.connected) return;
+  requestFanMode();
+  requestSmartPress();
+  requestNetworkInfo();
+}
+
+function handleReach() {
+  state.lastContact = Date.now();
+  if (!state.reachable) log('robot is reachable (replied)');
+  state.reachable = true;
+  state.ctrlEnabled = true;
+  clearReachTimer();
+  if (reachWaitResolve) reachWaitResolve(true);
+  setCtrlEnabled(true);
+  updateBadgeState(true);
 }
 
 function renderStatus() {
@@ -311,7 +360,7 @@ function connectMqtt(deviceId) {
   clearTimeout(mqttConnTimer);
   mqttConnTimer = setTimeout(() => {
     state.mqttConnecting = false;
-    if (!m.connected && state.device && devOnline(state.device)) {
+    if (!m.connected && state.device) {
       log('mqtt connect timed out');
       scheduleReconnect('connect timed out', false);
     }
@@ -335,12 +384,11 @@ function connectMqtt(deviceId) {
     log('MQTT connected');
     state.mqttOk = true;
     lastPing = Date.now();
+    updateBadgeState(null);
     m.subscribe('device/' + deviceId + '/app', 0, () => {
       log('subscribed device/' + deviceId + '/app');
-      setCtrlEnabled(devOnline(state.device));
-      requestFanMode();
-      requestSmartPress();
-      requestNetworkInfo();
+      sendProbes();
+      if (!state.reachable) armReachProbe(8000);
     });
   };
   m.onMessage = (topic, payload, raw) => handleAppMessage(topic, payload, raw);
@@ -350,7 +398,9 @@ function connectMqtt(deviceId) {
     log('MQTT disconnected');
     state.mqttOk = false;
     setCtrlEnabled(false);
-    if (state.device && devOnline(state.device)) scheduleReconnect('connection dropped', false);
+    state.ctrlEnabled = false;
+    updateBadgeState(false);
+    scheduleReconnect('connection dropped', false);
   };
   m.onError = (e) => log('MQTT error: ' + (e && e.message ? e.message : e));
 }
@@ -358,7 +408,7 @@ function connectMqtt(deviceId) {
 function scheduleReconnect(reason, useRefresh) {
   if (state.mqttReconnecting) return;
   if (!store.refresh) return;
-  if (!state.device || !devOnline(state.device)) { log('no reconnect: device offline'); return; }
+  if (!state.device) return;
   state.mqttReconnecting = true;
   const delay = state.retry.delay;
   clearTimeout(state.retry.timer);
@@ -403,28 +453,15 @@ async function pollDeviceStatus() {
       state.deviceId = newId;
       log('switched device to ' + String(newId).slice(0, 8) + ' (previous one offline)');
     }
-    const wasOnline = !!(state.device && devOnline(state.device));
-    const nowOnline = devOnline(d);
     if (state.device) state.device = Object.assign({}, state.device, d); else state.device = d;
-    updateOnlineBadge();
-    if (nowOnline && !wasOnline) {
-      log('robot is back online');
-      if (!state.mqtt.connected && !state.mqttConnecting && !state.mqttReconnecting) {
-        log('connecting…');
-        connectMqtt(state.deviceId);
-      } else {
-        state.mqttOk = true;
-        setCtrlEnabled(true);
-        requestFanMode();
-        requestSmartPress();
-        requestNetworkInfo();
-      }
+    updateBadgeState(state.reachable);
+    if (!state.mqtt.connected && !state.mqttConnecting && !state.mqttReconnecting) {
+      if (state.deviceId) connectMqtt(state.deviceId);
+    } else if (state.mqtt.connected && !state.reachable && !reachTimer) {
+      sendProbes();
+      armReachProbe(8000);
     }
-    if (!nowOnline && state.mqttOk) {
-      setCtrlEnabled(false);
-      state.mqttOk = false;
-    }
-    return (nowOnline ? 'robot is online' : 'robot is OFFLINE') + (nowOnline && d.sl_last_seen ? '' : '');
+    return state.mqtt.connected && state.reachable ? 'robot is online' : 'robot is OFFLINE';
   } catch (e) {
     log('status poll error: ' + e.message);
     return 'status check failed (' + e.message + ')';
@@ -522,12 +559,13 @@ function handleAppMessage(topic, payload, raw) {
   const text = bytesToStr(payload);
   const env = safeJson(text);
   if (!env || env.f === undefined) {
+    handleReach();
     log('rx: ' + text.slice(0, 120));
     return;
   }
   const f = env.f;
   const p = env.p;
-  state.lastContact = Date.now();
+  handleReach();
   renderWifi();
   switch (f) {
     case TYPE.POSE:
@@ -1189,27 +1227,37 @@ function wireControls() {
     const stamp = () => new Date().toLocaleTimeString();
     try {
       if (btn) { btn.textContent = 'Checking…'; btn.disabled = true; btn.classList.add('checking'); }
-      requestNetworkInfo();
-      const st = await pollDeviceStatus();
+      if (!state.mqtt.connected && !state.mqttConnecting && !state.mqttReconnecting && state.deviceId) {
+        connectMqtt(state.deviceId);
+        sendProbes();
+      } else {
+        sendProbes();
+      }
+      const ok = state.reachable ? true : await waitReach(12000);
       if (btn) { btn.disabled = false; btn.classList.remove('checking'); }
-      if (/online/.test(st)) {
+      if (ok) {
         if (btn) { btn.textContent = 'Online'; btn.classList.add('ok'); }
         if (b) {
-          b.textContent = 'Checked ' + stamp() + ': robot is ONLINE. WiFi: ' + (state.wifi && state.wifi.ssid ? state.wifi.ssid : '…');
+          b.textContent = 'Checked ' + stamp() + ': robot is ONLINE. WiFi: ' + (state.wifi && state.wifi.ssid ? state.wifi.ssid : '(no network info yet)');
           b.className = 'banner online';
         }
-        setTimeout(() => { if (btn) btn.textContent = 'Check robot now'; btn.classList.remove('ok'); updateOnlineBadge(); }, 6000);
+        setTimeout(() => { if (btn) btn.textContent = 'Check robot now'; btn.classList.remove('ok'); updateBadgeState(state.reachable); }, 6000);
+        $('ctrl-msg').textContent = 'robot is online (checked ' + stamp() + ')';
+        $('ctrl-msg').className = 'msg ok';
       } else {
         if (btn) { btn.textContent = 'Offline'; btn.classList.add('err'); }
+        const why = state.mqtt.connected
+          ? 'Robot was asked 3 ways but answered nothing in 12 s.'
+          : 'Cloud/MQTT link is not established yet (see log).';
         if (b) {
-          b.textContent = 'Checked ' + stamp() + ': robot is OFFLINE. It cannot answer commands until its WiFi is back. If it never reconnects, re-pair it over Bluetooth with the ZOOZEE app (2.4 GHz network).';
+          b.textContent = 'Checked ' + stamp() + ': robot is OFFLINE. ' + why + ' Power it on and check its 2.4 GHz WiFi, then retry.';
           b.className = 'banner';
         }
-        setTimeout(() => { if (btn) btn.textContent = 'Check robot now'; btn.classList.remove('err'); updateOnlineBadge(); }, 8000);
+        setTimeout(() => { if (btn) btn.textContent = 'Check robot now'; btn.classList.remove('err'); updateBadgeState(state.reachable); }, 8000);
+        $('ctrl-msg').textContent = 'robot is OFFLINE (checked ' + stamp() + ')';
+        $('ctrl-msg').className = 'msg err';
       }
-      $('ctrl-msg').textContent = st + ' (checked ' + stamp() + ')';
-      $('ctrl-msg').className = 'msg' + (/online/.test(st) ? ' ok' : '');
-      log('check result: ' + st);
+      log('check result: ' + (ok ? 'ONLINE' : 'OFFLINE'));
     } catch (e) {
       if (btn) { btn.textContent = 'Check robot now'; btn.disabled = false; btn.classList.remove('checking'); }
       $('ctrl-msg').textContent = 'check failed: ' + e.message;
@@ -1250,6 +1298,10 @@ function clearState() {
   state.wifi = null;
   state.wifiTs = 0;
   state.lastContact = 0;
+  state.reachable = false;
+  state.ctrlEnabled = false;
+  clearReachTimer();
+  if (reachWaitResolve) { reachWaitResolve(false); }
   renderWifi();
   state.walls = [];
   state.wallDirty = false;
@@ -1308,11 +1360,7 @@ async function enterMain() {
   try {
     await fetchUser();
     const deviceId = await fetchDevices();
-    if (devOnline(state.device)) {
-      connectMqtt(deviceId);
-    } else {
-      log('robot offline — waiting for it to come back');
-    }
+    connectMqtt(deviceId);
     pingLoop();
     startStatusPoll();
     refreshSchedules();
