@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v33';
+const APP_VER = 'v34';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -111,6 +111,7 @@ const state = {
   mapKind: null,       // 'live' (explore/sweep, while mapping) | 'entire' (17/18) | 'saved'
   mapSource: 'live',   // 'live' (robot) | 'saved' (viewing a stored/cloud map)
   mapLabel: '',        // name of the map currently being viewed
+  savedDock: null,     // dock pose stored with a viewed saved/cloud map
   savedMaps: [],       // locally saved snapshots: {id,name,savedAt,kind,tiles[]}
   cloudMaps: [],       // map list fetched from the cloud
   hasEntireMap: false, // true once an ENTIRE (17/18) map has been rendered
@@ -641,7 +642,9 @@ function handleAppMessage(topic, payload, raw) {
       }
       trackPose(state.pose);
       renderPose();
-      drawMap$();
+      // When viewing a saved/cloud map the pose/s trail aren't drawn, so a full
+      // repaint here would be wasted work.
+      if (state.mapSource !== 'saved') drawMap$();
       break;
     case TYPE.CURRENT_ACTION:
       state.action = p;
@@ -780,10 +783,10 @@ function tileKey(t) { return t.realX + ',' + t.realY + ',' + t.res; }
 function storeMapTile(p, kind) {
   // While viewing a saved/cloud map, ignore live robot tiles until the user
   // returns to the live layer (otherwise the robot stream overwrites it).
-  if (state.mapSource === 'saved' && kind !== 'saved') return;
-  if (!p || !p.map_data) { log('map msg without map_data'); return; }
+  if (state.mapSource === 'saved' && kind !== 'saved') return false;
+  if (!p || !p.map_data) { log('map msg without map_data'); return false; }
   const tile = MapRLE.decodeMapMessage(p);
-  if (!tile) { log('map decode failed'); return; }
+  if (!tile) { log('map decode failed'); return false; }
   // Switching between the live (mapping) layer and the complete map resets the
   // cache, so tiles from different frames never overlap into a jumbled mess.
   if (state.mapKind !== kind) {
@@ -827,6 +830,7 @@ function storeMapTile(p, kind) {
     log('map tile (' + kind + ') dims=' + tile.dimX + 'x' + tile.dimY + ' res=' + tile.res + ' real=(' + tile.realX + ',' + tile.realY + ') cells=' + tile.grid.length);
     log('map sample(A):\n' + gridAscii(tile.grid, tile.dimX, tile.dimY, 48, 18));
   }
+  return true;
 }
 
 /* Live tiles can stream at ~10 Hz while mapping; decode + rasterise is not free,
@@ -1047,51 +1051,55 @@ function renderMap() {
   roundRect(ctx, mx, my, mw, mh, 10);
   ctx.stroke();
 
-  // robot path trail (history of poses)
-  const trail = state.trail;
-  if (trail && trail.length > 1) {
-    ctx.strokeStyle = 'rgba(62,166,255,.85)';
-    ctx.lineWidth = Math.max(1.5, 0.025 * v.scale);
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    for (let i = 0; i < trail.length; i++) {
-      const sx = v.ox + (trail[i].x - b.minX) * v.scale;
-      const sy = v.oy + (trail[i].y - b.minY) * v.scale;
-      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  if (state.mapSource === 'saved') {
+    // Viewing a stored/cloud map: show its own dock (if any) but NOT the live
+    // robot pose/trail, which would be misleading on a different floor plan.
+    if (state.savedDock) drawDock(ctx, v, state.savedDock);
+  } else {
+    // robot path trail (history of poses)
+    const trail = state.trail;
+    if (trail && trail.length > 1) {
+      ctx.strokeStyle = 'rgba(62,166,255,.85)';
+      ctx.lineWidth = Math.max(1.5, 0.025 * v.scale);
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      for (let i = 0; i < trail.length; i++) {
+        const sx = v.ox + (trail[i].x - b.minX) * v.scale;
+        const sy = v.oy + (trail[i].y - b.minY) * v.scale;
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
-  }
 
-  // sweep path (robot-reported planned/executed path for this action)
-  const act = state.action;
-  if (act && Array.isArray(act.pt)) {
-    ctx.strokeStyle = 'rgba(62,166,255,.5)';
-    ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    act.pt.forEach((pt, i) => {
-      const sx = v.ox + (num(pt[0]) - b.minX) * v.scale;
-      const sy = v.oy + (num(pt[1]) - b.minY) * v.scale;
-      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-    });
-    ctx.stroke();
-  }
+    // sweep path (robot-reported planned/executed path for this action)
+    const act = state.action;
+    if (act && Array.isArray(act.pt)) {
+      ctx.strokeStyle = 'rgba(62,166,255,.5)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      act.pt.forEach((pt, i) => {
+        const sx = v.ox + (num(pt[0]) - b.minX) * v.scale;
+        const sy = v.oy + (num(pt[1]) - b.minY) * v.scale;
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      });
+      ctx.stroke();
+    }
 
-  // dock / charging station (home base)
-  if (state.dock) {
-    drawDock(ctx, v, state.dock);
-  }
+    // dock / charging station (home base)
+    if (state.dock) drawDock(ctx, v, state.dock);
 
-  // robot pose
-  if (state.pose) {
-    const p = worldToScreen(state.pose.x, state.pose.y);
-    const r = Math.max(4, 0.09 * v.scale);
-    ctx.fillStyle = '#3ea6ff';
-    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath();
-    ctx.moveTo(p.x + Math.cos(state.pose.yaw) * r * 2, p.y + Math.sin(state.pose.yaw) * r * 2);
-    ctx.lineTo(p.x, p.y);
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    // robot pose
+    if (state.pose) {
+      const p = worldToScreen(state.pose.x, state.pose.y);
+      const r = Math.max(4, 0.09 * v.scale);
+      ctx.fillStyle = '#3ea6ff';
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(p.x + Math.cos(state.pose.yaw) * r * 2, p.y + Math.sin(state.pose.yaw) * r * 2);
+      ctx.lineTo(p.x, p.y);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
   }
 
   // virtual walls
@@ -1470,6 +1478,7 @@ function clearMapLocal() {
   state.mapKind = null;
   state.mapSource = 'live';
   state.mapLabel = '';
+  state.savedDock = null;
   state.worldBounds = null;
   state.hasEntireMap = false;
   state._lastEntireReq = 0;
@@ -1499,17 +1508,17 @@ function resetAndExplore() {
 }
 
 /* ================= saved & cloud maps ================= */
-const SAVED_KEY = 'jarvis.maps';
+// Namespaced per account so maps never leak between users on a shared browser.
+function savedKey() { return 'jarvis.maps:' + (store.email || 'anon'); }
 
 function loadSavedIndex() {
-  try { state.savedMaps = JSON.parse(localStorage.getItem(SAVED_KEY) || '[]'); }
+  try { state.savedMaps = JSON.parse(localStorage.getItem(savedKey()) || '[]'); }
   catch (e) { state.savedMaps = []; }
   if (!Array.isArray(state.savedMaps)) state.savedMaps = [];
   renderSavedList();
 }
 function persistSavedIndex() {
-  try { localStorage.setItem(SAVED_KEY, JSON.stringify(state.savedMaps)); }
-  catch (e) { ctrlMsg('Could not save map (storage full?)', true); }
+  localStorage.setItem(savedKey(), JSON.stringify(state.savedMaps));
 }
 
 function currentPayloads() {
@@ -1529,16 +1538,22 @@ function saveCurrentMap() {
     name: name.slice(0, 40),
     savedAt: Date.now(),
     kind: state.mapKind || 'live',
+    dock: state.dock || null,
     tiles: payloads
   };
-  state.savedMaps.unshift(snap);
-  if (state.savedMaps.length > 30) state.savedMaps.length = 30;
-  persistSavedIndex();
+  const next = [snap, ...state.savedMaps];
+  if (next.length > 30) next.length = 30;
+  const prev = state.savedMaps;
+  state.savedMaps = next;
+  try { persistSavedIndex(); }
+  catch (e) { state.savedMaps = prev; ctrlMsg('Could not save map (browser storage full)', true); return; }
   renderSavedList();
   ctrlMsg('map saved: ' + snap.name, false);
 }
 
 function deleteSavedMap(id) {
+  const snap = state.savedMaps.find(s => s.id === id);
+  if (snap && !window.confirm('Delete saved map "' + snap.name + '"?')) return;
   state.savedMaps = state.savedMaps.filter(s => s.id !== id);
   persistSavedIndex();
   renderSavedList();
@@ -1548,7 +1563,10 @@ function loadSavedMap(id) {
   const snap = state.savedMaps.find(s => s.id === id);
   if (!snap || !snap.tiles || !snap.tiles.length) { ctrlMsg('saved map is empty', true); return; }
   const when = new Date(snap.savedAt).toLocaleDateString();
-  showMapFromPayloads(snap.tiles, snap.name + ' · saved ' + when);
+  if (!showMapFromPayloads(snap.tiles, snap.name + ' · saved ' + when, snap.dock)) {
+    ctrlMsg('this saved map could not be decoded', true);
+    return;
+  }
   ctrlMsg('showing saved map: ' + snap.name, false);
 }
 
@@ -1584,6 +1602,8 @@ function mapRow(name, meta, buttons) {
     btn.className = 'ctrl ' + b.cls;
     btn.textContent = b.label;
     btn.onclick = b.fn;
+    // Rows are created after wirePressFeedback() ran, so wire feedback here.
+    btn.addEventListener('pointerdown', () => pulseBtn(btn));
     row.appendChild(btn);
   }
   return row;
@@ -1600,6 +1620,8 @@ function cloudNameFor(mapId) {
 
 async function loadCloudMaps() {
   const el = $('cloud-maps');
+  if (state._cloudBusy) return;
+  state._cloudBusy = true;
   if (el) el.innerHTML = '<div class="muted small">Loading…</div>';
   try {
     await ensureAccess();
@@ -1610,10 +1632,13 @@ async function loadCloudMaps() {
     let list = safeJson(res.body);
     if (!Array.isArray(list)) list = (list && (list.content || list.maps)) || [];
     state.cloudMaps = list;
+    state._cloudCap = 20;
     renderCloudList();
     ctrlMsg('found ' + list.length + ' map(s) on the robot', false);
   } catch (e) {
     if (el) el.innerHTML = '<div class="muted small">' + (e && e.message) + '</div>';
+  } finally {
+    state._cloudBusy = false;
   }
 }
 
@@ -1647,8 +1672,8 @@ function renderCloudList() {
   const rest = state.cloudMaps
     .filter(m => !used.has(m.map_id || m.id))
     .sort((a, b) => String(b.last_updated || b.created || '').localeCompare(String(a.last_updated || a.created || '')));
-  const CAP = 20;
-  for (const m of rest.slice(0, CAP)) {
+  const cap = state._cloudCap || 20;
+  for (const m of rest.slice(0, cap)) {
     const id = m.map_id || m.id;
     rows.push({ name: cloudNameFor(id) || ('Map ' + String(id).slice(0, 8)), m });
   }
@@ -1661,10 +1686,12 @@ function renderCloudList() {
   }
   const hidden = state.cloudMaps.length - rows.length;
   if (hidden > 0) {
-    const note = document.createElement('div');
-    note.className = 'muted small';
-    note.textContent = '…and ' + hidden + ' older map' + (hidden === 1 ? '' : 's') + ' not shown.';
-    el.appendChild(note);
+    const more = document.createElement('button');
+    more.className = 'ctrl sm ghost';
+    more.style.marginTop = '6px';
+    more.textContent = 'Show ' + Math.min(hidden, 20) + ' more (of ' + hidden + ')';
+    more.onclick = () => { state._cloudCap = cap + 20; renderCloudList(); };
+    el.appendChild(more);
   }
 }
 
@@ -1677,17 +1704,30 @@ async function loadCloudMap(id, name) {
     });
     if (!metaRes.ok) { ctrlMsg('map fetch failed (HTTP ' + metaRes.status + ')', true); return; }
     const meta = safeJson(metaRes.body) || {};
+    const dx = Number(meta.dimensionX), dy = Number(meta.dimensionY);
+    const rx = Number(meta.realX), ry = Number(meta.realY);
+    if (!isFinite(dx) || !isFinite(dy) || !isFinite(rx) || !isFinite(ry) || dx <= 0 || dy <= 0) {
+      ctrlMsg('map metadata incomplete — cannot render', true);
+      log('cloud map meta: ' + JSON.stringify(meta).slice(0, 200));
+      return;
+    }
     const binRes = await http('/api/maps/' + id + '/binary');
     if (!binRes.ok) { ctrlMsg('map binary failed (HTTP ' + binRes.status + ')', true); return; }
     const mapData = (binRes.body || '').replace(/\s+/g, '');
     if (!mapData) { ctrlMsg('empty map data', true); return; }
     const payload = {
-      dimension_x: meta.dimensionX, dimension_y: meta.dimensionY,
-      resolution: meta.resolutionX || meta.resolution || 0.05,
-      real_x: meta.realX, real_y: meta.realY,
+      dimension_x: dx, dimension_y: dy,
+      resolution: Number(meta.resolutionX || meta.resolution) || 0.05,
+      real_x: rx, real_y: ry,
       map_data: mapData
     };
-    showMapFromPayloads([payload], name + ' · robot');
+    const dp = meta.dock_pose;
+    const dock = (dp && typeof dp === 'object' && isFinite(Number(dp.x)) && isFinite(Number(dp.y)))
+      ? { x: Number(dp.x), y: Number(dp.y), yaw: Number(dp.yaw) || 0 } : null;
+    if (!showMapFromPayloads([payload], name + ' · robot', dock)) {
+      ctrlMsg('this robot map could not be decoded', true);
+      return;
+    }
     ctrlMsg('showing robot map: ' + name, false);
   } catch (e) {
     ctrlMsg('map load error: ' + (e && e.message), true);
@@ -1695,20 +1735,32 @@ async function loadCloudMap(id, name) {
 }
 
 /* Render a set of raw map payloads as a standalone (saved/cloud) layer. Live
-   robot tiles are ignored until the user taps "Back to live". */
-function showMapFromPayloads(payloads, label) {
+   robot tiles are ignored until the user taps "Back to live". Returns the number
+   of tiles actually decoded, so the caller can detect a bad payload. */
+function showMapFromPayloads(payloads, label, dock) {
   state.mapSource = 'saved';
   state.mapKind = null;   // force storeMapTile to reset the layer cache
   state.view.fit = true;
-  for (const p of payloads) storeMapTile(p, 'saved');
+  let n = 0;
+  for (const p of payloads) { if (storeMapTile(p, 'saved')) n++; }
+  if (!n) {
+    // Nothing decoded — don't strand the user on an empty "saved" layer.
+    state.mapSource = 'live';
+    state.mapKind = null;
+    clearMapLocal();
+    return 0;
+  }
   state.mapLabel = label || '';
+  state.savedDock = dock || null;
   updateMapSourceUI();
   drawMap$();
+  return n;
 }
 
 function goLiveMap() {
   state.mapSource = 'live';
   state.mapLabel = '';
+  state.savedDock = null;
   clearMapLocal();
   updateMapSourceUI();
   requestEntireMap();
@@ -1898,6 +1950,7 @@ async function enterMain() {
   $('banner').classList.add('hidden');
   populateFanOptions();
   setCtrlEnabled(false);
+  loadSavedIndex();
   try {
     await fetchUser();
     const deviceId = await fetchDevices();
@@ -1930,7 +1983,6 @@ function init() {
   setupMap();
   setWallBank();
   renderWifi();
-  loadSavedIndex();
   startPoseTick();
   log('build ' + APP_VER + ' · ' + (typeof MapRLE !== 'undefined' && MapRLE.VER ? MapRLE.VER : 'rle-OLD'));
   try {
