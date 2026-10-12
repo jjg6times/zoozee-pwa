@@ -127,5 +127,6 @@
     }
   }
 
-  global.MapRLE = { decodeRLE, decodeMapMessage, base64ToBytes, cellToColor, selfTest };
+  const VER = 'rle26';
+  global.MapRLE = { VER, decodeRLE, decodeMapMessage, base64ToBytes, cellToColor, selfTest };
 })(window);

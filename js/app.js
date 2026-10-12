@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v26';
+const APP_VER = 'v27';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -223,7 +223,7 @@ async function fetchUser() {
   const res = await http('/api/users?user=' + encodeURIComponent(store.email));
   const j = jsonOk(res);
   state.user = j;
-  $('account-line').textContent = 'account: ' + store.email + ' · build ' + APP_VER;
+  $('account-line').textContent = 'account: ' + store.email + ' · build ' + APP_VER + ' · ' + (typeof MapRLE !== 'undefined' && MapRLE.VER ? MapRLE.VER : 'rle-OLD');
   log('user: ' + JSON.stringify(j).slice(0, 160));
 }
 
@@ -768,7 +768,7 @@ function storeMapTile(p) {
     bl.maxY = Math.max(bl.maxY, maxY);
   }
   if (state.view.fit) fitView();
-  $('map-status').textContent = 'map ' + tile.dimX + 'x' + tile.dimY + '  ' + state.mapCache.size + (state.mapCache.size > 1 ? ' tiles' : ' tile');
+  $('map-status').textContent = 'map ' + tile.dimX + 'x' + tile.dimY + '  ' + state.mapCache.size + (state.mapCache.size > 1 ? ' tiles' : ' tile') + ' · ' + (MapRLE.VER || 'rle-OLD');
   if (!state._mapLogged) {
     state._mapLogged = true;
     log('map tile dims=' + tile.dimX + 'x' + tile.dimY + ' res=' + tile.res + ' real=(' + tile.realX + ',' + tile.realY + ') cells=' + tile.grid.length);
@@ -1560,7 +1560,7 @@ function init() {
   setupMap();
   setWallBank();
   renderWifi();
-  log('build ' + APP_VER);
+  log('build ' + APP_VER + ' · ' + (typeof MapRLE !== 'undefined' && MapRLE.VER ? MapRLE.VER : 'rle-OLD'));
   try {
     const st = MapRLE.selfTest();
     log('decoder self-test: ' + (st.ok ? 'PASS' : 'FAIL') + ' ' + st.detail);
