@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v35';
+const APP_VER = 'v36';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -124,6 +124,8 @@ const state = {
   poseTs: 0,           // when the last POSE message arrived (ms)
   trail: [],           // robot path history [{x,y}] in meters
   _mapVer: 0,          // bumped when a map tile is stored/replaced (static layer cache)
+  _lastMapMsg: 0,      // when the last map message arrived (ms) — drives stale-map refresh
+  _lastEntireReq: 0,   // when we last asked the robot for the full map (ms)
   headingFlip: false,  // true once the heading arrow is calibrated to need its Y flipped
   _headScore1: 0,      // calibration scores for the two heading conventions
   _headScore2: 0,
@@ -585,7 +587,12 @@ function requestSmartPress() {
 function requestNetworkInfo() {
   sendCmd(CMD.NETWORK_INFO);
 }
-function requestEntireMap() {
+function requestEntireMap(force) {
+  // Throttle: if the robot is already streaming live tiles there's no need to
+  // ask for the whole map again; a 6 s floor stops request storms.
+  const now = Date.now();
+  if (!force && now - state._lastEntireReq < 6000) return;
+  state._lastEntireReq = now;
   sendCmd(CMD.ENTIRE_MAP);
 }
 function renderWifi() {
@@ -628,7 +635,15 @@ let pingTimer = null;
 let poseTimer = null;
 function startPoseTick() {
   if (poseTimer) return;
-  poseTimer = setInterval(renderPose, 1000);
+  poseTimer = setInterval(() => {
+    renderPose();
+    // Keep the map fresh: if the robot has gone quiet (not streaming tiles) but
+    // is still reachable, ask for the full map again so the pose never tracks
+    // over a stale floor plan.
+    if (state.mqtt && state.mqtt.connected && state.reachable && state.mapSource !== 'saved') {
+      if (Date.now() - state._lastMapMsg > 12000) requestEntireMap();
+    }
+  }, 1000);
 }
 function stopPoseTick() {
   if (poseTimer) { clearInterval(poseTimer); poseTimer = null; }
@@ -745,6 +760,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.ENTIRE_EXPLORE_MAP:
     case TYPE.ENTIRE_SWEEP_MAP:
       state.hasEntireMap = true;
+      state._lastMapMsg = Date.now();
       storeMapTile(p, 'entire');
       drawMap$();
       break;
@@ -752,6 +768,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.SWEEP_MAP:
       // Live tiles streamed while the robot is mapping. Rendered on their own
       // layer so they never mix with the complete (17/18) map.
+      state._lastMapMsg = Date.now();
       queueLive(p);
       break;
     default:
@@ -798,6 +815,9 @@ function trackPose(p) {
   if (!last) { t.push({ x: p.x, y: p.y }); return; }
   const d = Math.hypot(p.x - last.x, p.y - last.y);
   if (d > 1.0) {
+    // A big jump means the robot was picked up/moved (localization reset), so
+    // the cached map is now in the old frame — resync it from the robot.
+    requestEntireMap();
     t.push({ x: p.x, y: p.y, brk: true });
     if (t.length > 8000) t.splice(0, t.length - 8000);
     return;
@@ -1697,6 +1717,7 @@ function clearMapLocal() {
   state.worldBounds = null;
   state.hasEntireMap = false;
   state._lastEntireReq = 0;
+  state._lastMapMsg = 0;
   state._mapLogged = false;
   state.trail = [];
   state.view = { scale: 0, ox: 0, oy: 0, fit: true };
@@ -2136,6 +2157,7 @@ function wireControls() {
   on('btn-zoom-in', zoomIn);
   on('btn-zoom-out', zoomOut);
   on('btn-zoom-fit', resetView);
+  on('btn-map-refresh', () => requestEntireMap(true));
   on('btn-add-sched', addSchedule);
   on('btn-logout', logout);
   on('btn-copy-log', copyDiag);
@@ -2205,6 +2227,7 @@ function clearState() {
   state.mapSource = 'live';
   state.mapLabel = '';
   state._lastEntireReq = 0;
+  state._lastMapMsg = 0;
   state.mapCache = new Map();
   _scKey = ''; // force a fresh static layer (map reset / account switch)
   state.worldBounds = null;
