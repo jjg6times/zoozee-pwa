@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v24';
+const APP_VER = 'v25';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -108,6 +108,7 @@ const state = {
   mqttReconnecting: false,
   mqttConnecting: false,
   maps: [],            // received map tiles: {grid, dimX, dimY, res, realX, realY}
+  hasEntireMap: false, // true once an ENTIRE (17/18) map has been rendered
   mapCache: new Map(), // tileKey -> {tile, canvas, dirty}
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
   deviceId: null,
@@ -672,12 +673,23 @@ function handleAppMessage(topic, payload, raw) {
         renderWifi();
       }
       break;
-    case TYPE.EXPLORE_MAP:
-    case TYPE.SWEEP_MAP:
     case TYPE.ENTIRE_EXPLORE_MAP:
     case TYPE.ENTIRE_SWEEP_MAP:
+      state.hasEntireMap = true;
       storeMapTile(p);
       drawMap$();
+      break;
+    case TYPE.EXPLORE_MAP:
+    case TYPE.SWEEP_MAP:
+      // Partial/live tiles don't composite reliably (different frames), so we
+      // don't render them. Instead use them as a hint to refresh the entire map.
+      if (!state.hasEntireMap) {
+        const now = Date.now();
+        if (!state._lastEntireReq || now - state._lastEntireReq > 10000) {
+          state._lastEntireReq = now;
+          requestEntireMap();
+        }
+      }
       break;
     default:
       log('rx f=' + f + ' ' + bytesToStr(payload).slice(0, 160));
@@ -1432,6 +1444,8 @@ function show(id) {
 
 function clearState() {
   state.maps = [];
+  state.hasEntireMap = false;
+  state._lastEntireReq = 0;
   state.mapCache = new Map();
   state.worldBounds = null;
   state.pose = null;
