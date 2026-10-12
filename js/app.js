@@ -1622,14 +1622,49 @@ function renderCloudList() {
   if (!el) return;
   el.innerHTML = '';
   if (!state.cloudMaps.length) { el.innerHTML = '<div class="muted small">No maps stored on the robot.</div>'; return; }
-  for (const m of state.cloudMaps) {
+
+  const byId = new Map(state.cloudMaps.map(m => [m.map_id || m.id, m]));
+  const fmt = (m) => {
+    const dx = m.dimensionX, dy = m.dimensionY;
+    const when = String(m.last_updated || m.created || '').slice(0, 10);
+    return (dx && dy ? dx + '×' + dy + ' · ' : '') + when;
+  };
+  const rows = [];
+  const used = new Set();
+  const d = (state.device && state.device.properties) || {};
+
+  // Favourites first (the 3 named slots on the robot).
+  for (const n of [1, 2, 3]) {
+    const id = d['fav_map_' + n + '_id'];
+    const m = id && byId.get(id);
+    if (m) { rows.push({ name: d['fav_map_' + n + '_name'] || ('Favourite ' + n), m }); used.add(id); }
+  }
+  // Then the map the robot is currently using.
+  const cur = state.device && state.device.current_map;
+  if (cur && byId.get(cur) && !used.has(cur)) { rows.push({ name: 'Current map', m: byId.get(cur) }); used.add(cur); }
+
+  // Then the rest, newest first (the account keeps a long history).
+  const rest = state.cloudMaps
+    .filter(m => !used.has(m.map_id || m.id))
+    .sort((a, b) => String(b.last_updated || b.created || '').localeCompare(String(a.last_updated || a.created || '')));
+  const CAP = 20;
+  for (const m of rest.slice(0, CAP)) {
     const id = m.map_id || m.id;
-    const name = cloudNameFor(id) || ('Map ' + String(id).slice(0, 8));
-    const meta = (m.dimensionX && m.dimensionY ? m.dimensionX + '×' + m.dimensionY + ' · ' : '') +
-      (m.created ? String(m.created).slice(0, 10) : '');
-    el.appendChild(mapRow(name, meta, [
-      { label: 'Load', cls: 'xs', fn: () => loadCloudMap(id, name) }
+    rows.push({ name: cloudNameFor(id) || ('Map ' + String(id).slice(0, 8)), m });
+  }
+
+  for (const r of rows) {
+    const id = r.m.map_id || r.m.id;
+    el.appendChild(mapRow(r.name, fmt(r.m), [
+      { label: 'Load', cls: 'xs', fn: () => loadCloudMap(id, r.name) }
     ]));
+  }
+  const hidden = state.cloudMaps.length - rows.length;
+  if (hidden > 0) {
+    const note = document.createElement('div');
+    note.className = 'muted small';
+    note.textContent = '…and ' + hidden + ' older map' + (hidden === 1 ? '' : 's') + ' not shown.';
+    el.appendChild(note);
   }
 }
 
