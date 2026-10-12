@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v30';
+const APP_VER = 'v31';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -113,6 +113,7 @@ const state = {
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
   deviceId: null,
   pose: null,          // {x,y,yaw}
+  poseTs: 0,           // when the last POSE message arrived (ms)
   trail: [],           // robot path history [{x,y}] in meters
   action: null,        // {an,st,pt,ms}
   battery: null,
@@ -326,16 +327,26 @@ function sendProbes() {
 
 function handleReach() {
   state.lastContact = Date.now();
-  if (!state.reachable) log('robot is reachable (replied)');
+  clearReachTimer();
+  if (state.reachable) return; // already online — avoid per-message DOM writes
+  log('robot is reachable (replied)');
   state.reachable = true;
   state.ctrlEnabled = true;
-  clearReachTimer();
   if (reachWaitResolve) reachWaitResolve(true);
   setCtrlEnabled(true);
   updateBadgeState(true);
+  renderPose();
 }
 
+/* Coalesce status repaints to one per animation frame — POSE/ACTION messages
+   can arrive at ~10 Hz and each one used to trigger a full DOM update. */
+let _statusRaf = 0;
 function renderStatus() {
+  if (_statusRaf) return;
+  _statusRaf = requestAnimationFrame(() => { _statusRaf = 0; renderStatusNow(); });
+}
+
+function renderStatusNow() {
   const pillB = $('pill-battery');
   const pillC = $('pill-charge');
   if (state.battery != null) {
@@ -363,9 +374,21 @@ function renderStatus() {
     actionTxt += ` · ${state.area.toFixed(1)} m² · ${mm}:${String(ss).padStart(2, '0')}`;
   }
   $('action-line').textContent = actionTxt;
-  if (state.pose) {
-    $('pos-line').textContent = `x: ${state.pose.x.toFixed(2)} m   y: ${state.pose.y.toFixed(2)} m`;
-  }
+  renderPose();
+}
+
+/* Live pose readout: x, y, heading, and whether the fix is fresh (so you can
+   tell at a glance if the robot has lost localization — a stale/frozen pose). */
+function renderPose() {
+  const el = $('pos-line');
+  if (!el) return;
+  const p = state.pose;
+  if (!p) { el.textContent = 'pose: waiting for robot…'; el.className = 'status-line muted'; return; }
+  const ageS = state.poseTs ? (Date.now() - state.poseTs) / 1000 : Infinity;
+  const deg = ((p.yaw * 180 / Math.PI) % 360 + 360) % 360;
+  const live = ageS < 5 ? 'live' : (isFinite(ageS) ? 'stale ' + Math.floor(ageS) + 's' : 'stale');
+  el.textContent = `x ${p.x.toFixed(2)} m  ·  y ${p.y.toFixed(2)} m  ·  yaw ${deg.toFixed(0)}°  ·  ${live}`;
+  el.className = 'status-line' + (ageS < 5 ? '' : ' muted');
 }
 
 /* ================= MQTT ================= */
@@ -495,7 +518,7 @@ async function pollDeviceStatus() {
 }
 
 function setCtrlEnabled(on) {
-  const ids = ['btn-sweep', 'btn-edge', 'btn-spot', 'btn-home', 'btn-find', 'btn-wall', 'btn-wall-save'];
+  const ids = ['btn-sweep', 'btn-edge', 'btn-spot', 'btn-home', 'btn-find', 'btn-wall', 'btn-wall-save', 'btn-remap', 'btn-all-clear'];
   ids.forEach(id => { const el = $(id); if (el) el.disabled = !on; });
   $('btn-stop').disabled = !on;
   $('fan-mode').disabled = !on;
@@ -572,6 +595,14 @@ function strToBytes(s) {
 
 let lastPing = 0;
 let pingTimer = null;
+let poseTimer = null;
+function startPoseTick() {
+  if (poseTimer) return;
+  poseTimer = setInterval(renderPose, 1000);
+}
+function stopPoseTick() {
+  if (poseTimer) { clearInterval(poseTimer); poseTimer = null; }
+}
 function pingLoop() {
   if (pingTimer) return;
   pingTimer = setInterval(() => {
@@ -595,12 +626,16 @@ function handleAppMessage(topic, payload, raw) {
   const f = env.f;
   const p = env.p;
   handleReach();
-  renderWifi();
   switch (f) {
     case TYPE.POSE:
       state.pose = { x: num(p.x), y: num(p.y), yaw: num(p.yaw) };
+      state.poseTs = Date.now();
+      if (!state._poseLogged) {
+        state._poseLogged = true;
+        log('pose sample: x=' + p.x + ' y=' + p.y + ' yaw=' + p.yaw);
+      }
       trackPose(state.pose);
-      renderStatus();
+      renderPose();
       drawMap$();
       break;
     case TYPE.CURRENT_ACTION:
@@ -648,11 +683,12 @@ function handleAppMessage(topic, payload, raw) {
       state.area = num(p);
       renderStatus();
       break;
-    case TYPE.SWEEP_FAN_MODE:
+    case TYPE.SWEEP_FAN_MODE: {
       state.fanMode = num(p);
       const sel = $('fan-mode');
       if (sel && sel.value === '') sel.value = String(state.fanMode);
       break;
+    }
     case TYPE.SMART_PRESSURIZATION:
       if (p && typeof p === 'object' && p.value !== undefined) {
         state.carpetBoost = !!p.value;
@@ -922,7 +958,15 @@ function drawDock(ctx, v, dock) {
   ctx.restore();
 }
 
+/* Coalesce map repaints: POSE streaming at ~10 Hz used to trigger a full canvas
+   redraw per message. Now at most one redraw per animation frame. */
+let _mapRaf = 0;
 function drawMap$() {
+  if (_mapRaf) return;
+  _mapRaf = requestAnimationFrame(() => { _mapRaf = 0; renderMap(); });
+}
+
+function renderMap() {
   const canvas = $('map');
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
@@ -1381,6 +1425,34 @@ function wirePressFeedback() {
   });
 }
 
+function clearMapLocal() {
+  state.maps = [];
+  state.mapCache = new Map();
+  state.worldBounds = null;
+  state.hasEntireMap = false;
+  state._lastEntireReq = 0;
+  state._mapLogged = false;
+  state.trail = [];
+  state.view = { scale: 0, ox: 0, oy: 0, fit: true };
+  const ms = $('map-status');
+  if (ms) ms.textContent = 'Waiting for map…';
+  drawMap$();
+}
+
+function resetAndExplore() {
+  if (!state.mqtt.connected) { ctrlMsg('Not connected (robot offline?)', true); return; }
+  if (!window.confirm('Reset the saved map and build a new one?\n\nThe robot will wipe its floor plan and drive around to map the room again. Best to put it on the dock first.')) return;
+  ctrlMsg('resetting map…', false);
+  sendCmd(CMD.CLEAR_MAP);
+  clearMapLocal();
+  log('remap: sent CLEAR_MAP; starting auto-explore in 3s');
+  clearTimeout(state._remapTimer);
+  state._remapTimer = setTimeout(() => {
+    sendCmd(CMD.START_AUTO_EXPLORING);
+    ctrlMsg('map reset — mapping a new floor plan (let it do a full lap)', false);
+  }, 3000);
+}
+
 function wireControls() {
   on('btn-sweep', () => sendCmd(CMD.SWEEP));
   on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
@@ -1391,11 +1463,13 @@ function wireControls() {
   on('btn-all-clear', () => {
     if (window.confirm('Reset (clear) the robot mapping? This wipes the saved floor plan and starts a new map.')) {
       sendCmd(CMD.CLEAR_MAP);
+      clearMapLocal();
     }
   });
   on('btn-wall', toggleWallMode);
   on('btn-wall-save', saveWalls);
   on('btn-wall-clear', clearWalls);
+  on('btn-remap', resetAndExplore);
   on('btn-zoom-in', zoomIn);
   on('btn-zoom-out', zoomOut);
   on('btn-zoom-fit', resetView);
@@ -1466,6 +1540,8 @@ function clearState() {
   state.mapCache = new Map();
   state.worldBounds = null;
   state.pose = null;
+  state.poseTs = 0;
+  state._poseLogged = false;
   state.trail = [];
   state._mapLogged = false;
   state.action = null;
@@ -1505,6 +1581,7 @@ function clearState() {
 
 function logout() {
   stopStatusPoll();
+  stopPoseTick();
   if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
   clearTimeout(mqttConnTimer);
   state.mqtt.disconnect();
@@ -1577,6 +1654,7 @@ function init() {
   setupMap();
   setWallBank();
   renderWifi();
+  startPoseTick();
   log('build ' + APP_VER + ' · ' + (typeof MapRLE !== 'undefined' && MapRLE.VER ? MapRLE.VER : 'rle-OLD'));
   try {
     const st = MapRLE.selfTest();

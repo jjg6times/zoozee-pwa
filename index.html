@@ -20,7 +20,7 @@
         <div class="brand-icon">J</div>
         <h1>Jarvis Remote</h1>
         <p class="sub">ZOOZEE Z70 / Slamtec cloud</p>
-        <p class="ver-stamp">build v30</p>
+        <p class="ver-stamp">build v31</p>
       </div>
       <form id="login-form" autocomplete="on">
         <label>Email / account</label>
@@ -67,7 +67,7 @@
       <div class="panel">
         <div class="panel-title">Status</div>
         <div id="action-line" class="status-line">Idle</div>
-        <div id="pos-line" class="status-line muted">x: –  y: –</div>
+        <div id="pos-line" class="status-line muted">pose: waiting for robot…</div>
         <div id="wifi-line" class="status-line muted small">WiFi: —</div>
         <div class="opt-row">
           <button class="ctrl sm" id="btn-check-now">Check robot now</button>
@@ -105,6 +105,7 @@
         </div>
         <p id="wall-status" class="status-line muted small"></p>
         <button class="ctrl warn ghost" id="btn-all-clear">Reset map on robot</button>
+        <button class="ctrl ok ghost" id="btn-remap">Reset map + map again</button>
       </div>
 
       <div class="panel" id="schedule-panel">
