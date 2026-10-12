@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v31';
+const APP_VER = 'v32';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -108,6 +108,7 @@ const state = {
   mqttReconnecting: false,
   mqttConnecting: false,
   maps: [],            // received map tiles: {grid, dimX, dimY, res, realX, realY}
+  mapKind: null,       // 'live' (explore/sweep, while mapping) | 'entire' (17/18)
   hasEntireMap: false, // true once an ENTIRE (17/18) map has been rendered
   mapCache: new Map(), // tileKey -> {tile, canvas, dirty}
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
@@ -712,20 +713,14 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.ENTIRE_EXPLORE_MAP:
     case TYPE.ENTIRE_SWEEP_MAP:
       state.hasEntireMap = true;
-      storeMapTile(p);
+      storeMapTile(p, 'entire');
       drawMap$();
       break;
     case TYPE.EXPLORE_MAP:
     case TYPE.SWEEP_MAP:
-      // Partial/live tiles don't composite reliably (different frames), so we
-      // don't render them. Instead use them as a hint to refresh the entire map.
-      if (!state.hasEntireMap) {
-        const now = Date.now();
-        if (!state._lastEntireReq || now - state._lastEntireReq > 10000) {
-          state._lastEntireReq = now;
-          requestEntireMap();
-        }
-      }
+      // Live tiles streamed while the robot is mapping. Rendered on their own
+      // layer so they never mix with the complete (17/18) map.
+      queueLive(p);
       break;
     default:
       log('rx f=' + f + ' ' + bytesToStr(payload).slice(0, 160));
@@ -773,13 +768,26 @@ function trackPose(p) {
   }
 }
 
-function tileKey(t) { return t.realX + ',' + t.realY + ',' + t.res + ',' + t.dimX + 'x' + t.dimY; }
+/* Key by origin + resolution only (NOT dimensions): a live tile grows in size
+   as the robot explores, and we want each update to replace the previous one
+   rather than accumulate overlapping copies. */
+function tileKey(t) { return t.realX + ',' + t.realY + ',' + t.res; }
 
-function storeMapTile(p) {
+function storeMapTile(p, kind) {
   if (!p || !p.map_data) { log('map msg without map_data'); return; }
   const tile = MapRLE.decodeMapMessage(p);
   if (!tile) { log('map decode failed'); return; }
-  // Dedupe: the robot retransmits tiles often; keep one entry per tile origin.
+  // Switching between the live (mapping) layer and the complete map resets the
+  // cache, so tiles from different frames never overlap into a jumbled mess.
+  if (state.mapKind !== kind) {
+    state.mapKind = kind;
+    state.mapCache = new Map();
+    state.maps = [];
+    state.worldBounds = null;
+    state._mapLogged = false;
+    state.view.fit = true;
+    log('map layer: ' + kind);
+  }
   const key = tileKey(tile);
   const entry = state.mapCache.get(key);
   if (entry) {
@@ -804,11 +812,34 @@ function storeMapTile(p) {
     bl.maxY = Math.max(bl.maxY, maxY);
   }
   if (state.view.fit) fitView();
-  $('map-status').textContent = 'map ' + tile.dimX + 'x' + tile.dimY + '  ' + state.mapCache.size + (state.mapCache.size > 1 ? ' tiles' : ' tile') + ' · ' + (MapRLE.VER || 'rle-OLD');
+  $('map-status').textContent = (kind === 'live' ? 'mapping… ' : 'map ') + tile.dimX + 'x' + tile.dimY +
+    '  ' + state.mapCache.size + (state.mapCache.size > 1 ? ' tiles' : ' tile') + ' · ' + (MapRLE.VER || 'rle-OLD');
   if (!state._mapLogged) {
     state._mapLogged = true;
-    log('map tile dims=' + tile.dimX + 'x' + tile.dimY + ' res=' + tile.res + ' real=(' + tile.realX + ',' + tile.realY + ') cells=' + tile.grid.length);
+    log('map tile (' + kind + ') dims=' + tile.dimX + 'x' + tile.dimY + ' res=' + tile.res + ' real=(' + tile.realX + ',' + tile.realY + ') cells=' + tile.grid.length);
     log('map sample(A):\n' + gridAscii(tile.grid, tile.dimX, tile.dimY, 48, 18));
+  }
+}
+
+/* Live tiles can stream at ~10 Hz while mapping; decode + rasterise is not free,
+   so coalesce to ~5 Hz but always flush the last frame so nothing is missed. */
+let _livePending = null, _liveLast = 0, _liveTimer = null;
+function queueLive(p) {
+  const now = Date.now();
+  if (now - _liveLast >= 180) {
+    _liveLast = now;
+    storeMapTile(p, 'live');
+    drawMap$();
+    return;
+  }
+  _livePending = p;
+  if (!_liveTimer) {
+    _liveTimer = setTimeout(() => {
+      _liveTimer = null;
+      _liveLast = Date.now();
+      const q = _livePending; _livePending = null;
+      if (q) { storeMapTile(q, 'live'); drawMap$(); }
+    }, 180);
   }
 }
 
@@ -1428,12 +1459,15 @@ function wirePressFeedback() {
 function clearMapLocal() {
   state.maps = [];
   state.mapCache = new Map();
+  state.mapKind = null;
   state.worldBounds = null;
   state.hasEntireMap = false;
   state._lastEntireReq = 0;
   state._mapLogged = false;
   state.trail = [];
   state.view = { scale: 0, ox: 0, oy: 0, fit: true };
+  _livePending = null;
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
   const ms = $('map-status');
   if (ms) ms.textContent = 'Waiting for map…';
   drawMap$();
@@ -1536,6 +1570,7 @@ function show(id) {
 function clearState() {
   state.maps = [];
   state.hasEntireMap = false;
+  state.mapKind = null;
   state._lastEntireReq = 0;
   state.mapCache = new Map();
   state.worldBounds = null;
