@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v34';
+const APP_VER = 'v35';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -24,7 +24,9 @@ const CMD = {
   STOP: 24, GO_HOME: 25, SWEEP: 26, SWEEP_SPOT: 27, CLEAR_MAP: 54, FIND_ME: 56,
   START_SWEEP_REGION: 68, START_AUTO_EXPLORING: 108, START_EDGE_SWEEPING: 109,
   UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
-  GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42
+  GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42,
+  GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
+  UPDATE_SWEEP_REGION: 67
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -121,6 +123,14 @@ const state = {
   pose: null,          // {x,y,yaw}
   poseTs: 0,           // when the last POSE message arrived (ms)
   trail: [],           // robot path history [{x,y}] in meters
+  _mapVer: 0,          // bumped when a map tile is stored/replaced (static layer cache)
+  headingFlip: false,  // true once the heading arrow is calibrated to need its Y flipped
+  _headScore1: 0,      // calibration scores for the two heading conventions
+  _headScore2: 0,
+  _headN: 0,
+  _headDone: false,
+  history: [],         // cleaning history [{ts,type,durSec,areaM2,sweepSec}]
+  run: null,           // currently-observed cleaning run
   action: null,        // {an,st,pt,ms}
   battery: null,
   charging: null,
@@ -132,6 +142,12 @@ const state = {
   walls: [],           // [{id,x0,y0,x1,y1}] in meters (virtual walls)
   wallMode: false,
   wallDirty: false,
+  _wallVer: 0,         // bumped on wall changes (invalidates the static map layer)
+  noGo: [],            // [{id,x0,y0,x1,y1}] no-go (forbidden) rectangles in meters
+  noGoMode: false,
+  noGoDirty: false,
+  noGoDraft: null,
+  _nogoVer: 0,         // bumped on no-go zone changes (invalidates static map layer)
   dock: null,          // {x,y,yaw} dock/charging pose
   wifi: null,          // live network info {ssid, ip, mac}
   wifiTs: 0,
@@ -353,6 +369,7 @@ function renderStatus() {
 }
 
 function renderStatusNow() {
+  trackRun();
   const pillB = $('pill-battery');
   const pillC = $('pill-charge');
   if (state.battery != null) {
@@ -524,7 +541,7 @@ async function pollDeviceStatus() {
 }
 
 function setCtrlEnabled(on) {
-  const ids = ['btn-sweep', 'btn-edge', 'btn-spot', 'btn-home', 'btn-find', 'btn-wall', 'btn-wall-save', 'btn-remap', 'btn-all-clear'];
+  const ids = ['btn-sweep', 'btn-edge', 'btn-spot', 'btn-home', 'btn-find', 'btn-wall', 'btn-wall-save', 'btn-nogo', 'btn-remap', 'btn-all-clear'];
   ids.forEach(id => { const el = $(id); if (el) el.disabled = !on; });
   $('btn-stop').disabled = !on;
   $('fan-mode').disabled = !on;
@@ -534,6 +551,13 @@ function setCtrlEnabled(on) {
     state.wallDraft = null;
     const btn = $('btn-wall');
     if (btn) { btn.textContent = '＋ Wall'; btn.classList.remove('active'); }
+    drawMap$();
+  }
+  if (!on && state.noGoMode) {
+    state.noGoMode = false;
+    state.noGoDraft = null;
+    const btn = $('btn-nogo');
+    if (btn) { btn.textContent = '＋ Zone'; btn.classList.remove('active'); }
     drawMap$();
   }
 }
@@ -673,6 +697,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.VIRTUAL_WALLS:
       if (!state.wallDirty) {
         state.walls = parseWalls(p);
+        state._wallVer++;
         setWallBank();
         drawMap$();
       }
@@ -764,14 +789,37 @@ function bytesToStr(u8) {
 }
 
 /* ================= map ================= */
+/* Jumps >1 m are treated as teleports (robot picked up / re-localised) and start
+   a new trail segment so we never draw a false line across the map. */
 function trackPose(p) {
   if (!p || !isFinite(p.x) || !isFinite(p.y)) return;
   const t = state.trail;
   const last = t[t.length - 1];
-  // Only add a point if the robot actually moved (>2 cm) to keep the trail clean.
-  if (!last || Math.hypot(p.x - last.x, p.y - last.y) > 0.02) {
+  if (!last) { t.push({ x: p.x, y: p.y }); return; }
+  const d = Math.hypot(p.x - last.x, p.y - last.y);
+  if (d > 1.0) {
+    t.push({ x: p.x, y: p.y, brk: true });
+    if (t.length > 8000) t.splice(0, t.length - 8000);
+    return;
+  }
+  if (d > 0.02) {
     t.push({ x: p.x, y: p.y });
     if (t.length > 8000) t.splice(0, t.length - 8000);
+    // Self-calibrate the heading arrow: the direction of travel is ground truth
+    // for which yaw convention makes the arrow point where the robot is going.
+    if (!state._headDone && d > 0.15) {
+      const ux = (p.x - last.x) / d, uy = (p.y - last.y) / d;
+      const c = Math.cos(p.yaw), s = Math.sin(p.yaw);
+      state._headScore1 += ux * c + uy * s;      // dx=cos, dy=+sin
+      state._headScore2 += ux * c + uy * (-s);   // dx=cos, dy=-sin
+      state._headN++;
+      if (state._headN >= 6 && Math.abs(state._headScore1 - state._headScore2) > 1.5) {
+        state._headDone = true;
+        state.headingFlip = state._headScore2 > state._headScore1;
+        log('heading calibration: ' + (state.headingFlip ? 'MIRRORED (y flipped)' : 'standard') +
+          ' (scores ' + state._headScore1.toFixed(1) + ' vs ' + state._headScore2.toFixed(1) + ')');
+      }
+    }
   }
 }
 
@@ -810,6 +858,7 @@ function storeMapTile(p, kind) {
     tileToCanvas(e);
     state.mapCache.set(key, e);
   }
+  state._mapVer++;
   const minX = tile.realX, minY = tile.realY;
   const maxX = tile.realX + tile.dimX * tile.res;
   const maxY = tile.realY + tile.dimY * tile.res;
@@ -1015,41 +1064,23 @@ function renderMap() {
   const dpr = window.devicePixelRatio || 1;
   const W = canvas.clientWidth, H = canvas.clientHeight;
   if (W === 0 || H === 0) return;
-  if (canvas.width !== W * dpr || canvas.height !== H * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+  const wpx = Math.round(W * dpr), hpx = Math.round(H * dpr);
+  if (canvas.width !== wpx || canvas.height !== hpx) { canvas.width = wpx; canvas.height = hpx; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = '#0a0f1c';
-  ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = false;
   const b = state.worldBounds;
   if (!b || !state.view.scale) {
-    ctx.fillStyle = '#8a93a8';
-    ctx.textAlign = 'center';
-    ctx.font = '13px sans-serif';
+    ctx.fillStyle = '#0a0f1c'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#8a93a8'; ctx.textAlign = 'center'; ctx.font = '13px sans-serif';
     ctx.fillText('Waiting for map…', W / 2, H / 2);
     return;
   }
   const v = state.view;
-  ctx.imageSmoothingEnabled = false;
-  // soft map panel behind the floor plan so it reads as a clean surface
-  const mx = v.ox, my = v.oy, mw = (b.maxX - b.minX) * v.scale, mh = (b.maxY - b.minY) * v.scale;
-  ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,.45)';
-  ctx.shadowBlur = 16;
-  ctx.shadowOffsetY = 5;
-  ctx.fillStyle = '#0f1626';
-  roundRect(ctx, mx, my, mw, mh, 10);
-  ctx.fill();
-  ctx.restore();
-  for (const entry of state.mapCache.values()) {
-    const t = entry.tile;
-    const tx = v.ox + (t.realX - b.minX) * v.scale;
-    const ty = v.oy + (t.realY - b.minY) * v.scale;
-    ctx.drawImage(entry.canvas, tx, ty, t.dimX * t.res * v.scale, t.dimY * t.res * v.scale);
-  }
-  // subtle border around the mapped area
-  ctx.strokeStyle = 'rgba(125,146,186,.28)';
-  ctx.lineWidth = 1;
-  roundRect(ctx, mx, my, mw, mh, 10);
-  ctx.stroke();
+  // The static layer (floor plan + walls + no-go zones) only changes when the
+  // map, view or zones change; POSE streams (~10 Hz) reuse it in one blit plus a
+  // couple of cheap overlays, instead of re-rasterising every tile each frame.
+  if (_scKey !== staticLayerKey(W, H, dpr, v, b) || !_sc) buildStaticLayer(W, H, dpr, v, b);
+  ctx.drawImage(_sc, 0, 0, W, H);
 
   if (state.mapSource === 'saved') {
     // Viewing a stored/cloud map: show its own dock (if any) but NOT the live
@@ -1064,10 +1095,12 @@ function renderMap() {
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
       ctx.beginPath();
+      let pen = false;
       for (let i = 0; i < trail.length; i++) {
-        const sx = v.ox + (trail[i].x - b.minX) * v.scale;
-        const sy = v.oy + (trail[i].y - b.minY) * v.scale;
-        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        const pt = trail[i];
+        const sx = v.ox + (pt.x - b.minX) * v.scale;
+        const sy = v.oy + (pt.y - b.minY) * v.scale;
+        if (pt.brk || !pen) { ctx.moveTo(sx, sy); pen = true; } else { ctx.lineTo(sx, sy); }
       }
       ctx.stroke();
     }
@@ -1096,14 +1129,16 @@ function renderMap() {
       ctx.fillStyle = '#3ea6ff';
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
       ctx.beginPath();
-      ctx.moveTo(p.x + Math.cos(state.pose.yaw) * r * 2, p.y + Math.sin(state.pose.yaw) * r * 2);
+      ctx.moveTo(p.x + Math.cos(state.pose.yaw) * r * 2,
+        p.y + Math.sin(state.pose.yaw) * (state.headingFlip ? -1 : 1) * r * 2);
       ctx.lineTo(p.x, p.y);
       ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
     }
   }
 
-  // virtual walls
-  drawWalls(ctx, v, b, state.wallDraft || null);
+  // draft walls / no-go box (committed ones are baked into the static layer)
+  drawWalls(ctx, v, b, state.wallDraft && state.wallDraft.x1 !== undefined ? state.wallDraft : null, true);
+  drawNoGo(ctx, v, b, state.noGoDraft && state.noGoDraft.x1 !== undefined ? state.noGoDraft : null, true);
 
   // spot region selection
   if (state.spot && state.spotCur) {
@@ -1115,8 +1150,8 @@ function renderMap() {
   }
 }
 
-function drawWalls(ctx, v, b, draft) {
-  const walls = state.walls.slice();
+function drawWalls(ctx, v, b, draft, only) {
+  const walls = only ? [] : state.walls.slice();
   if (draft && draft.x1 !== undefined) walls.push(draft);
   ctx.lineCap = 'round';
   for (const w of walls) {
@@ -1144,6 +1179,68 @@ function drawWalls(ctx, v, b, draft) {
     ctx.fillStyle = '#ff8fa3';
     for (const pt of [s, e]) { ctx.beginPath(); ctx.arc(pt.x, pt.y, Math.max(3, 0.03 * v.scale), 0, Math.PI * 2); ctx.fill(); }
   }
+}
+
+function drawNoGo(ctx, v, b, draft, only) {
+  const zones = only ? [] : state.noGo.slice();
+  if (draft && draft.x1 !== undefined) zones.push(draft);
+  for (const z of zones) {
+    const x0 = v.ox + (Math.min(z.x0, z.x1) - b.minX) * v.scale;
+    const y0 = v.oy + (Math.min(z.y0, z.y1) - b.minY) * v.scale;
+    const w = Math.abs(z.x1 - z.x0) * v.scale;
+    const h = Math.abs(z.y1 - z.y0) * v.scale;
+    if (w < 1 && h < 1) continue;
+    ctx.fillStyle = z.draft ? 'rgba(255,71,87,.16)' : 'rgba(255,71,87,.13)';
+    ctx.fillRect(x0, y0, w, h);
+    ctx.strokeStyle = z.draft ? 'rgba(255,71,87,.75)' : '#ff4757';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([7, 5]);
+    ctx.strokeRect(x0, y0, w, h);
+    ctx.setLineDash([]);
+    if (w > 8 && h > 8) {
+      ctx.beginPath();
+      ctx.moveTo(x0, y0); ctx.lineTo(x0 + w, y0 + h);
+      ctx.moveTo(x0 + w, y0); ctx.lineTo(x0, y0 + h);
+      ctx.stroke();
+    }
+  }
+}
+
+/* ---- static map layer cache ---- */
+let _sc = null, _scx = null, _scKey = '';
+function staticLayerKey(W, H, dpr, v, b) {
+  return [W, H, dpr, v.scale.toFixed(4), v.ox.toFixed(2), v.oy.toFixed(2),
+    b.minX, b.minY, b.maxX, b.maxY,
+    state._mapVer || 0, state._wallVer || 0, state._nogoVer || 0].join('|');
+}
+function buildStaticLayer(W, H, dpr, v, b) {
+  if (!_sc) { _sc = document.createElement('canvas'); _scx = _sc.getContext('2d'); }
+  _sc.width = Math.max(1, Math.round(W * dpr));
+  _sc.height = Math.max(1, Math.round(H * dpr));
+  const c = _scx;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.imageSmoothingEnabled = false;
+  c.fillStyle = '#0a0f1c'; c.fillRect(0, 0, W, H);
+  // soft map panel behind the floor plan so it reads as a clean surface
+  const mx = v.ox, my = v.oy, mw = (b.maxX - b.minX) * v.scale, mh = (b.maxY - b.minY) * v.scale;
+  c.save();
+  c.shadowColor = 'rgba(0,0,0,.45)'; c.shadowBlur = 16; c.shadowOffsetY = 5;
+  c.fillStyle = '#0f1626';
+  roundRect(c, mx, my, mw, mh, 10); c.fill();
+  c.restore();
+  for (const entry of state.mapCache.values()) {
+    const t = entry.tile;
+    const tx = v.ox + (t.realX - b.minX) * v.scale;
+    const ty = v.oy + (t.realY - b.minY) * v.scale;
+    c.drawImage(entry.canvas, tx, ty, t.dimX * t.res * v.scale, t.dimY * t.res * v.scale);
+  }
+  // subtle border around the mapped area
+  c.strokeStyle = 'rgba(125,146,186,.28)'; c.lineWidth = 1;
+  roundRect(c, mx, my, mw, mh, 10); c.stroke();
+  drawWalls(c, v, b, null);
+  drawNoGo(c, v, b, null);
+  _scKey = staticLayerKey(W, H, dpr, v, b);
+  return _sc;
 }
 
 function drawAll() { drawMap$(); }
@@ -1181,6 +1278,7 @@ function finishWallDraft() {
   const id = state.walls.reduce((m, w) => Math.max(m, w.id), -1) + 1;
   state.walls.push({ id, x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 });
   state.wallDirty = true;
+  state._wallVer++;
   ctrlMsg('wall added — tap Save to send', false);
   setWallBank();
   drawMap$();
@@ -1196,9 +1294,102 @@ function saveWalls() {
 function clearWalls() {
   state.walls = [];
   state.wallDirty = true;
+  state._wallVer++;
   setWallBank();
   drawMap$();
   ctrlMsg('walls cleared — tap Save to send', false);
+}
+
+/* ================= no-go (forbidden) zones ================= */
+function setNoGoBank() {
+  const el = $('nogo-status');
+  if (!el) return;
+  el.textContent = (state.noGoDirty ? '● unsaved · ' : '') + state.noGo.length + ' zone' + (state.noGo.length === 1 ? '' : 's') + (state.noGoMode ? ' — drag a box, tap a zone to delete' : '') + (state.noGo.length && !state.noGoDirty ? ' · experimental send' : '');
+  const save = $('btn-nogo-save');
+  const clear = $('btn-nogo-clear');
+  if (save) save.disabled = !state.noGoDirty;
+  if (clear) clear.disabled = !state.noGo.length && !state.noGoDirty;
+}
+
+function toggleNoGoMode() {
+  if (!state.mqttOk) { ctrlMsg('Connect first', true); return; }
+  state.noGoMode = !state.noGoMode;
+  if (state.noGoMode) {
+    if (state.wallMode) {
+      state.wallMode = false;
+      const wb = $('btn-wall');
+      if (wb) { wb.textContent = '＋ Wall'; wb.classList.remove('active'); }
+      state.wallDraft = null;
+      setWallBank();
+    }
+    if (state.spot) {
+      state.spot = false;
+      $('btn-spot').textContent = 'Spot region';
+      state.spotCur = null;
+    }
+  }
+  const btn = $('btn-nogo');
+  if (btn) { btn.textContent = state.noGoMode ? 'Cancel' : '＋ Zone'; btn.classList.toggle('active', state.noGoMode); }
+  state.noGoDraft = null;
+  setNoGoBank();
+  drawMap$();
+}
+
+function finishNoGoDraft() {
+  const d = state.noGoDraft;
+  if (!d || d.x1 === undefined) return;
+  if (Math.abs(d.x1 - d.x0) < 0.15 || Math.abs(d.y1 - d.y0) < 0.15) {
+    ctrlMsg('Zone too small (drag a box)', true);
+    return;
+  }
+  const id = state.noGo.reduce((m, z) => Math.max(m, z.id), -1) + 1;
+  state.noGo.push({ id, x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 });
+  state.noGoDirty = true;
+  state._nogoVer++;
+  ctrlMsg('no-go zone added — tap Save to send', false);
+  setNoGoBank();
+  drawMap$();
+}
+
+function noGoToRegion(z) {
+  // Sweep-region objects carry a type: 0 normal, 1 forbidden (no-go), 2 mop.
+  return {
+    label: 'PWA no-go',
+    rad: 0.05,
+    type: 1,
+    points: [
+      { x: z.x0, y: z.y0 }, { x: z.x1, y: z.y0 },
+      { x: z.x1, y: z.y1 }, { x: z.x0, y: z.y1 }
+    ]
+  };
+}
+
+function saveNoGo() {
+  if (!state.mqttOk) { ctrlMsg('Not connected', true); return; }
+  if (!state.noGo.length) { ctrlMsg('No zones to save', true); return; }
+  sendCmd(CMD.CREATE_SWEEP_REGION, state.noGo.map(noGoToRegion));
+  state.noGoDirty = false;
+  setNoGoBank();
+  ctrlMsg('no-go zones sent to robot (experimental)', false);
+}
+
+function clearNoGo() {
+  state.noGo = [];
+  state.noGoDirty = true;
+  state._nogoVer++;
+  setNoGoBank();
+  drawMap$();
+  ctrlMsg('zones cleared — tap Save to send', false);
+}
+
+function nearestNoGo(p) {
+  let best = null;
+  for (const z of state.noGo) {
+    const a = worldToScreen(Math.min(z.x0, z.x1), Math.min(z.y0, z.y1));
+    const c = worldToScreen(Math.max(z.x0, z.x1), Math.max(z.y0, z.y1));
+    if (p.x >= a.x && p.x <= c.x && p.y >= a.y && p.y <= c.y) best = z;
+  }
+  return best;
 }
 
 function distToSegment(p, a, b) {
@@ -1239,6 +1430,10 @@ function setupMap() {
         const w = screenToWorld(p.x, p.y);
         if (w) state.wallDraft = { draft: true, x0: w.x, y0: w.y, x1: w.x, y1: w.y };
       }
+      if (state.noGoMode) {
+        const w = screenToWorld(p.x, p.y);
+        if (w) state.noGoDraft = { draft: true, x0: w.x, y0: w.y, x1: w.x, y1: w.y };
+      }
       drawMap$();
     } else if (ptrs.size === 2) {
       const [a, b] = [...ptrs.values()];
@@ -1269,6 +1464,10 @@ function setupMap() {
       const w = screenToWorld(p.x, p.y);
       if (w && state.wallDraft) { state.wallDraft.x1 = w.x; state.wallDraft.y1 = w.y; }
       drawMap$();
+    } else if (state.noGoMode) {
+      const w = screenToWorld(p.x, p.y);
+      if (w && state.noGoDraft) { state.noGoDraft.x1 = w.x; state.noGoDraft.y1 = w.y; }
+      drawMap$();
     } else if (down.moved) {
       state.view.ox += dx; state.view.oy += dy;
       state.view.fit = false;
@@ -1290,20 +1489,34 @@ function setupMap() {
         if (hit) {
           state.walls = state.walls.filter(w => w.id !== hit.id);
           state.wallDirty = true;
+          state._wallVer++;
           setWallBank();
           ctrlMsg('wall removed — tap Save to send', false);
           drawMap$();
         }
       } else if (state.spot) {
         // tap with no drag = nothing to send
+      } else if (state.noGoMode && state.worldBounds) {
+        const hit = nearestNoGo(p);
+        if (hit) {
+          state.noGo = state.noGo.filter(z => z.id !== hit.id);
+          state.noGoDirty = true;
+          state._nogoVer++;
+          setNoGoBank();
+          ctrlMsg('zone removed — tap Save to send', false);
+          drawMap$();
+        }
       }
     } else if (state.wallMode) {
       finishWallDraft();
+    } else if (state.noGoMode) {
+      finishNoGoDraft();
     } else if (state.spot && state.worldBounds) {
       endSpotRegion(p);
     }
     down = null;
     state.wallDraft = null;
+    state.noGoDraft = null;
   };
   canvas.addEventListener('pointerup', finishPointer);
   canvas.addEventListener('pointercancel', finishPointer);
@@ -1342,6 +1555,7 @@ function endSpotRegion(p) {
 
 function toggleSpot() {
   if (state.wallMode) toggleWallMode();
+  if (state.noGoMode) toggleNoGoMode();
   state.spot = !state.spot;
   $('btn-spot').textContent = state.spot ? 'Drag on map…' : 'Spot region';
   if (!state.spot) { state.spotCur = null; state.spotStart = null; }
@@ -1475,6 +1689,7 @@ function wirePressFeedback() {
 function clearMapLocal() {
   state.maps = [];
   state.mapCache = new Map();
+  _scKey = ''; // force a fresh static layer on the next render
   state.mapKind = null;
   state.mapSource = 'live';
   state.mapLabel = '';
@@ -1559,6 +1774,16 @@ function deleteSavedMap(id) {
   renderSavedList();
 }
 
+function renameSavedMap(id) {
+  const s = state.savedMaps.find(x => x.id === id);
+  if (!s) return;
+  const name = (window.prompt('Rename map:', s.name) || '').trim();
+  if (!name) return;
+  s.name = name.slice(0, 40);
+  persistSavedIndex();
+  renderSavedList();
+}
+
 function loadSavedMap(id) {
   const snap = state.savedMaps.find(s => s.id === id);
   if (!snap || !snap.tiles || !snap.tiles.length) { ctrlMsg('saved map is empty', true); return; }
@@ -1578,6 +1803,7 @@ function renderSavedList() {
   for (const s of state.savedMaps) {
     el.appendChild(mapRow(s.name, new Date(s.savedAt).toLocaleString(), [
       { label: 'Load', cls: 'xs', fn: () => loadSavedMap(s.id) },
+      { label: '✎', cls: 'xs', fn: () => renameSavedMap(s.id) },
       { label: '✕', cls: 'xs warn', fn: () => deleteSavedMap(s.id) }
     ]));
   }
@@ -1775,6 +2001,114 @@ function updateMapSourceUI() {
   if (btn) btn.classList.toggle('hidden', !viewing);
 }
 
+/* ================= cleaning history & stats ================= */
+function historyKey() { return 'jarvis.history:' + (store.email || 'anon'); }
+function loadHistory() {
+  try { state.history = JSON.parse(localStorage.getItem(historyKey()) || '[]'); }
+  catch (e) { state.history = []; }
+  if (!Array.isArray(state.history)) state.history = [];
+  renderHistory();
+}
+function persistHistory() {
+  try { localStorage.setItem(historyKey(), JSON.stringify(state.history)); } catch (e) { /* noop */ }
+}
+function currentRunType() {
+  const act = state.action;
+  const an = act && act.an;
+  if (an === 4) return 'Sweep';
+  if (an === 0) return 'Mapping';
+  if (an === 5) return 'Spot';
+  if (an === 6) return 'Edge';
+  const st = state.status;
+  if (st === 6) return 'Sweep';
+  if (st === 11 || st === 12) return 'Spot';
+  if (st === 20) return 'Mapping';
+  if (st === 22) return 'Edge';
+  const t = state.statusText || '';
+  if (/return|dock|charg|idle|complete/i.test(t)) return null;
+  if (/sweep/i.test(t)) return 'Sweep';
+  if (/explor/i.test(t)) return 'Mapping';
+  if (/edge/i.test(t)) return 'Edge';
+  if (/spot/i.test(t)) return 'Spot';
+  return null;
+}
+function trackRun() {
+  const type = currentRunType();
+  const r = state.run;
+  if (!type) { if (r) finalizeRun(); return; }
+  if (!r || r.type !== type) {
+    if (r) finalizeRun();
+    state.run = {
+      type, startTs: Date.now(),
+      startArea: state.area || 0, maxArea: state.area || 0, maxTime: state.sweepTime || 0
+    };
+  } else {
+    r.maxArea = Math.max(r.maxArea, state.area || 0);
+    r.maxTime = Math.max(r.maxTime, state.sweepTime || 0);
+  }
+}
+function finalizeRun() {
+  const r = state.run;
+  state.run = null;
+  if (!r) return;
+  const durSec = Math.round((Date.now() - r.startTs) / 1000);
+  const area = r.maxArea || 0;
+  if (durSec < 15 && area < 1) return; // ignore blips / false starts
+  state.history.unshift({
+    ts: r.startTs,
+    type: r.type,
+    durSec,
+    areaM2: Math.round(area * 100) / 100,
+    sweepSec: Math.round(r.maxTime || 0),
+    batt: state.battery
+  });
+  if (state.history.length > 50) state.history.length = 50;
+  persistHistory();
+  renderHistory();
+}
+function fmtDur(sec) {
+  sec = Math.round(sec || 0);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + s + 's';
+}
+function renderHistory() {
+  const el = $('history-list');
+  const sum = $('history-summary');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!state.history.length) {
+    el.innerHTML = '<div class="muted small">No cleaning recorded yet. Runs are logged automatically while sweeping, mapping, spot or edge cleaning.</div>';
+    if (sum) sum.textContent = '';
+    return;
+  }
+  let area = 0, dur = 0;
+  for (const e of state.history) { area += e.areaM2 || 0; dur += e.durSec || 0; }
+  if (sum) sum.textContent = state.history.length + ' runs · ' + area.toFixed(1) + ' m² · ' + fmtDur(dur) + ' total';
+  for (const e of state.history) {
+    const row = document.createElement('div');
+    row.className = 'map-item';
+    const txt = document.createElement('div');
+    txt.className = 'map-text';
+    const nm = document.createElement('div');
+    nm.className = 'map-name';
+    nm.textContent = e.type + '  ·  ' + new Date(e.ts).toLocaleString();
+    const mt = document.createElement('div');
+    mt.className = 'muted small';
+    mt.textContent = (e.areaM2 ? e.areaM2 + ' m²' : '—') + '  ·  ' + fmtDur(e.sweepSec || e.durSec) + (e.batt != null ? '  ·  ' + e.batt + '%' : '');
+    txt.appendChild(nm);
+    txt.appendChild(mt);
+    row.appendChild(txt);
+    el.appendChild(row);
+  }
+}
+function clearHistory() {
+  if (!state.history.length) return;
+  if (!window.confirm('Clear all cleaning history?')) return;
+  state.history = [];
+  persistHistory();
+  renderHistory();
+}
+
 function wireControls() {
   on('btn-sweep', () => sendCmd(CMD.SWEEP));
   on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
@@ -1791,6 +2125,10 @@ function wireControls() {
   on('btn-wall', toggleWallMode);
   on('btn-wall-save', saveWalls);
   on('btn-wall-clear', clearWalls);
+  on('btn-nogo', toggleNoGoMode);
+  on('btn-nogo-save', saveNoGo);
+  on('btn-nogo-clear', clearNoGo);
+  on('btn-history-clear', clearHistory);
   on('btn-remap', resetAndExplore);
   on('btn-save-map', saveCurrentMap);
   on('btn-load-robot', loadCloudMaps);
@@ -1859,6 +2197,8 @@ function show(id) {
 }
 
 function clearState() {
+  if (state.run) finalizeRun();
+  state.history = [];
   state.maps = [];
   state.hasEntireMap = false;
   state.mapKind = null;
@@ -1866,6 +2206,7 @@ function clearState() {
   state.mapLabel = '';
   state._lastEntireReq = 0;
   state.mapCache = new Map();
+  _scKey = ''; // force a fresh static layer (map reset / account switch)
   state.worldBounds = null;
   state.pose = null;
   state.poseTs = 0;
@@ -1898,6 +2239,15 @@ function clearState() {
   state.walls = [];
   state.wallDirty = false;
   state.wallMode = false;
+  state.noGo = [];
+  state.noGoDirty = false;
+  state.noGoMode = false;
+  state.noGoDraft = null;
+  state.headingFlip = false;
+  state._headDone = false;
+  state._headN = 0;
+  state._headScore1 = 0;
+  state._headScore2 = 0;
   state.spot = false;
   state.spotCur = null;
   state.view = { scale: 0, ox: 0, oy: 0, fit: true };
@@ -1905,6 +2255,9 @@ function clearState() {
   if (sp) sp.textContent = 'Spot region';
   const wb = $('btn-wall');
   if (wb) { wb.textContent = '＋ Wall'; wb.classList.remove('active'); }
+  const nb = $('btn-nogo');
+  if (nb) { nb.textContent = '＋ Zone'; nb.classList.remove('active'); }
+  setNoGoBank();
 }
 
 function logout() {
@@ -1951,6 +2304,7 @@ async function enterMain() {
   populateFanOptions();
   setCtrlEnabled(false);
   loadSavedIndex();
+  loadHistory();
   try {
     await fetchUser();
     const deviceId = await fetchDevices();
@@ -1982,6 +2336,7 @@ function init() {
   wirePressFeedback();
   setupMap();
   setWallBank();
+  setNoGoBank();
   renderWifi();
   startPoseTick();
   log('build ' + APP_VER + ' · ' + (typeof MapRLE !== 'undefined' && MapRLE.VER ? MapRLE.VER : 'rle-OLD'));

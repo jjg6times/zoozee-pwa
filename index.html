@@ -20,7 +20,7 @@
         <div class="brand-icon">J</div>
         <h1>Jarvis Remote</h1>
         <p class="sub">ZOOZEE Z70 / Slamtec cloud</p>
-        <p class="ver-stamp">build v34</p>
+        <p class="ver-stamp">build v35</p>
       </div>
       <form id="login-form" autocomplete="on">
         <label>Email / account</label>
@@ -104,6 +104,13 @@
           <button class="ctrl sm ok" id="btn-wall-save" disabled>Save</button>
         </div>
         <p id="wall-status" class="status-line muted small"></p>
+        <div class="opt-row wall-row">
+          <span>No-go zones</span>
+          <button class="ctrl sm" id="btn-nogo">＋ Zone</button>
+          <button class="ctrl sm" id="btn-nogo-clear" disabled>Clear</button>
+          <button class="ctrl sm ok" id="btn-nogo-save" disabled>Save</button>
+        </div>
+        <p id="nogo-status" class="status-line muted small"></p>
         <button class="ctrl warn ghost" id="btn-all-clear">Reset map on robot</button>
         <button class="ctrl ok ghost" id="btn-remap">Reset map + map again</button>
       </div>
@@ -134,6 +141,13 @@
           <button id="btn-add-sched">Add</button>
         </div>
         <p id="sched-msg" class="msg"></p>
+      </div>
+
+      <div class="panel" id="history-panel">
+        <div class="panel-title">Cleaning history</div>
+        <div id="history-summary" class="status-line muted small"></div>
+        <div id="history-list" class="maplist"></div>
+        <button class="ctrl sm ghost" id="btn-history-clear">Clear history</button>
       </div>
 
       <div class="panel">
