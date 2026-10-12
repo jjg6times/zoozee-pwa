@@ -1,4 +1,4 @@
-const CACHE = 'jarvis-remote-v27';
+const CACHE = 'jarvis-remote-v28';
 const ASSETS = [
   './',
   './index.html',
@@ -14,11 +14,12 @@ const ASSETS = [
 self.addEventListener('install', (e) => {
   e.waitUntil(
     caches.open(CACHE).then(async (c) => {
-      // Bypass the HTTP cache so a new SW version always grabs fresh files
-      // (prevents mixed old/new code when the CDN updates files at different times).
+      // Bypass the HTTP cache so a new SW version always grabs fresh files.
       for (const u of ASSETS) {
-        const res = await fetch(new Request(u, { cache: 'reload' }));
-        await c.put(u, res);
+        try {
+          const res = await fetch(new Request(u, { cache: 'reload' }));
+          await c.put(u, res);
+        } catch (err) { /* keep going; network-first below will fill in */ }
       }
     }).then(() => self.skipWaiting())
   );
@@ -36,16 +37,22 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// Network-first (revalidating) so online users ALWAYS get the latest app shell;
+// fall back to the cache only when offline. This prevents the app from getting
+// stuck on a stale rle.js/app.js after a deploy.
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  // Only use the cache for same-origin static assets.
   if (url.origin !== self.location.origin) return;
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    caches.match(e.request).then((hit) => hit || fetch(e.request).then((res) => {
-      const copy = res.clone();
-      caches.open(CACHE).then((c) => c.put(e.request, copy));
-      return res;
-    }).catch(() => caches.match('./index.html')))
+    fetch(e.request, { cache: 'no-cache' })
+      .then((res) => {
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
+        }
+        return res;
+      })
+      .catch(() => caches.match(e.request).then((hit) => hit || caches.match('./index.html')))
   );
 });
