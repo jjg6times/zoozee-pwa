@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v28';
+const APP_VER = 'v29';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -793,20 +793,32 @@ function gridAscii(grid, dimX, dimY, cols, rows) {
 
 function tileToCanvas(entry) {
   const t = entry.tile;
-  const c = document.createElement('canvas');
-  c.width = t.dimX; c.height = t.dimY;
-  const cx = c.getContext('2d');
-  const img = cx.createImageData(t.dimX, t.dimY);
   const g = t.grid;
+  // Base occupancy image: 1 pixel per cell.
+  const small = document.createElement('canvas');
+  small.width = t.dimX; small.height = t.dimY;
+  const sx = small.getContext('2d');
+  const img = sx.createImageData(t.dimX, t.dimY);
   for (let i = 0; i < g.length; i++) {
     const v = g[i];
     if (v === 0) continue;
     const idx = i * 4;
-    if (v > 127) { img.data[idx] = 42; img.data[idx + 1] = 49; img.data[idx + 2] = 66; }
-    else { img.data[idx] = 238; img.data[idx + 1] = 241; img.data[idx + 2] = 246; }
+    // free space = clean off-white floor; obstacles = dark slate walls
+    if (v > 127) { img.data[idx] = 22; img.data[idx + 1] = 29; img.data[idx + 2] = 44; }
+    else { img.data[idx] = 237; img.data[idx + 1] = 242; img.data[idx + 2] = 249; }
     img.data[idx + 3] = 255;
   }
-  cx.putImageData(img, 0, 0);
+  sx.putImageData(img, 0, 0);
+  // Supersample so the map stays crisp when the view scales it up on high-DPI
+  // phone screens (a 1px/cell image upscaled ~6x is what made it look fuzzy).
+  const maxDim = Math.max(t.dimX, t.dimY);
+  let SS = 6;
+  while (maxDim * SS > 2048 && SS > 1) SS--;
+  const c = document.createElement('canvas');
+  c.width = t.dimX * SS; c.height = t.dimY * SS;
+  const cx = c.getContext('2d');
+  cx.imageSmoothingEnabled = true;
+  cx.drawImage(small, 0, 0, c.width, c.height);
   entry.canvas = c;
 }
 
@@ -940,12 +952,27 @@ function drawMap$() {
   }
   const v = state.view;
   ctx.imageSmoothingEnabled = true;
+  // soft map panel behind the floor plan so it reads as a clean surface
+  const mx = v.ox, my = v.oy, mw = (b.maxX - b.minX) * v.scale, mh = (b.maxY - b.minY) * v.scale;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,.45)';
+  ctx.shadowBlur = 16;
+  ctx.shadowOffsetY = 5;
+  ctx.fillStyle = '#0f1626';
+  roundRect(ctx, mx, my, mw, mh, 10);
+  ctx.fill();
+  ctx.restore();
   for (const entry of state.mapCache.values()) {
     const t = entry.tile;
     const tx = v.ox + (t.realX - b.minX) * v.scale;
     const ty = v.oy + (t.realY - b.minY) * v.scale;
     ctx.drawImage(entry.canvas, tx, ty, t.dimX * t.res * v.scale, t.dimY * t.res * v.scale);
   }
+  // subtle border around the mapped area
+  ctx.strokeStyle = 'rgba(125,146,186,.28)';
+  ctx.lineWidth = 1;
+  roundRect(ctx, mx, my, mw, mh, 10);
+  ctx.stroke();
 
   // robot path trail (history of poses)
   const trail = state.trail;
