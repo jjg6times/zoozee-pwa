@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v29';
+const APP_VER = 'v30';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -794,31 +794,21 @@ function gridAscii(grid, dimX, dimY, cols, rows) {
 function tileToCanvas(entry) {
   const t = entry.tile;
   const g = t.grid;
-  // Base occupancy image: 1 pixel per cell.
-  const small = document.createElement('canvas');
-  small.width = t.dimX; small.height = t.dimY;
-  const sx = small.getContext('2d');
-  const img = sx.createImageData(t.dimX, t.dimY);
+  // Occupancy image: 1 pixel per cell. Drawn with image smoothing OFF, so each
+  // cell stays a crisp block at any zoom (no blur on high-DPI screens).
+  const c = document.createElement('canvas');
+  c.width = t.dimX; c.height = t.dimY;
+  const cx = c.getContext('2d');
+  const img = cx.createImageData(t.dimX, t.dimY);
   for (let i = 0; i < g.length; i++) {
     const v = g[i];
     if (v === 0) continue;
     const idx = i * 4;
-    // free space = clean off-white floor; obstacles = dark slate walls
     if (v > 127) { img.data[idx] = 22; img.data[idx + 1] = 29; img.data[idx + 2] = 44; }
     else { img.data[idx] = 237; img.data[idx + 1] = 242; img.data[idx + 2] = 249; }
     img.data[idx + 3] = 255;
   }
-  sx.putImageData(img, 0, 0);
-  // Supersample so the map stays crisp when the view scales it up on high-DPI
-  // phone screens (a 1px/cell image upscaled ~6x is what made it look fuzzy).
-  const maxDim = Math.max(t.dimX, t.dimY);
-  let SS = 6;
-  while (maxDim * SS > 2048 && SS > 1) SS--;
-  const c = document.createElement('canvas');
-  c.width = t.dimX * SS; c.height = t.dimY * SS;
-  const cx = c.getContext('2d');
-  cx.imageSmoothingEnabled = true;
-  cx.drawImage(small, 0, 0, c.width, c.height);
+  cx.putImageData(img, 0, 0);
   entry.canvas = c;
 }
 
@@ -951,7 +941,7 @@ function drawMap$() {
     return;
   }
   const v = state.view;
-  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingEnabled = false;
   // soft map panel behind the floor plan so it reads as a clean surface
   const mx = v.ox, my = v.oy, mw = (b.maxX - b.minX) * v.scale, mh = (b.maxY - b.minY) * v.scale;
   ctx.save();
