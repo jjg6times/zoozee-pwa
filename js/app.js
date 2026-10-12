@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v23';
+const APP_VER = 'v24';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -112,6 +112,7 @@ const state = {
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
   deviceId: null,
   pose: null,          // {x,y,yaw}
+  trail: [],           // robot path history [{x,y}] in meters
   action: null,        // {an,st,pt,ms}
   battery: null,
   charging: null,
@@ -597,6 +598,7 @@ function handleAppMessage(topic, payload, raw) {
   switch (f) {
     case TYPE.POSE:
       state.pose = { x: num(p.x), y: num(p.y), yaw: num(p.yaw) };
+      trackPose(state.pose);
       renderStatus();
       drawMap$();
       break;
@@ -712,6 +714,17 @@ function bytesToStr(u8) {
 }
 
 /* ================= map ================= */
+function trackPose(p) {
+  if (!p || !isFinite(p.x) || !isFinite(p.y)) return;
+  const t = state.trail;
+  const last = t[t.length - 1];
+  // Only add a point if the robot actually moved (>2 cm) to keep the trail clean.
+  if (!last || Math.hypot(p.x - last.x, p.y - last.y) > 0.02) {
+    t.push({ x: p.x, y: p.y });
+    if (t.length > 8000) t.splice(0, t.length - 8000);
+  }
+}
+
 function tileKey(t) { return t.realX + ',' + t.realY + ',' + t.res + ',' + t.dimX + 'x' + t.dimY; }
 
 function storeMapTile(p) {
@@ -744,6 +757,26 @@ function storeMapTile(p) {
   }
   if (state.view.fit) fitView();
   $('map-status').textContent = 'map ' + tile.dimX + 'x' + tile.dimY + '  ' + state.mapCache.size + (state.mapCache.size > 1 ? ' tiles' : ' tile');
+  if (!state._mapLogged) {
+    state._mapLogged = true;
+    log('map tile dims=' + tile.dimX + 'x' + tile.dimY + ' res=' + tile.res + ' real=(' + tile.realX + ',' + tile.realY + ') cells=' + tile.grid.length);
+    log('map sample(A):\n' + gridAscii(tile.grid, tile.dimX, tile.dimY, 48, 18));
+  }
+}
+
+function gridAscii(grid, dimX, dimY, cols, rows) {
+  const sx = Math.max(1, Math.floor(dimX / cols));
+  const sy = Math.max(1, Math.floor(dimY / rows));
+  let s = '';
+  for (let y = 0; y < dimY; y += sy) {
+    let line = '';
+    for (let x = 0; x < dimX; x += sx) {
+      const v = grid[y * dimX + x];
+      line += (v > 127) ? '#' : (v ? '.' : ' ');
+    }
+    s += line + '\n';
+  }
+  return s;
 }
 
 function tileToCanvas(entry) {
@@ -810,6 +843,71 @@ function screenToWorld(px, py) {
   return { x: (px - v.ox) / v.scale + b.minX, y: (py - v.oy) / v.scale + b.minY };
 }
 
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Draw the home/charging base as a small "home + charging" glyph.
+function drawDock(ctx, v, dock) {
+  const d = worldToScreen(dock.x, dock.y);
+  const s = Math.max(14, 0.24 * v.scale); // glyph size in px
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  ctx.rotate(dock.yaw || 0);
+
+  // soft glow
+  const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, s * 1.15);
+  glow.addColorStop(0, 'rgba(125,224,163,.45)');
+  glow.addColorStop(1, 'rgba(125,224,163,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(0, 0, s * 1.15, 0, Math.PI * 2); ctx.fill();
+
+  // rounded dock base
+  const w = s * 1.25, h = s * 0.92, r = s * 0.28;
+  ctx.fillStyle = '#0e2b1e';
+  ctx.strokeStyle = '#7de0a3';
+  ctx.lineWidth = Math.max(1.5, s * 0.08);
+  roundRect(ctx, -w / 2, -h / 2, w, h, r);
+  ctx.fill(); ctx.stroke();
+
+  // roof
+  ctx.beginPath();
+  ctx.moveTo(-w * 0.32, -h * 0.08);
+  ctx.lineTo(0, -h * 0.46);
+  ctx.lineTo(w * 0.32, -h * 0.08);
+  ctx.strokeStyle = '#7de0a3';
+  ctx.lineWidth = Math.max(1.5, s * 0.08);
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // lightning bolt (charging)
+  ctx.fillStyle = '#7de0a3';
+  ctx.beginPath();
+  ctx.moveTo(s * 0.08, -h * 0.14);
+  ctx.lineTo(-s * 0.10, s * 0.10);
+  ctx.lineTo(s * 0.00, s * 0.10);
+  ctx.lineTo(-s * 0.06, h * 0.38);
+  ctx.lineTo(s * 0.16, -s * 0.02);
+  ctx.lineTo(s * 0.02, -s * 0.02);
+  ctx.closePath();
+  ctx.fill();
+
+  // label (kept upright)
+  ctx.rotate(-(dock.yaw || 0));
+  ctx.fillStyle = '#7de0a3';
+  ctx.font = '600 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('HOME', 0, -s * 0.95);
+  ctx.restore();
+}
+
 function drawMap$() {
   const canvas = $('map');
   const ctx = canvas.getContext('2d');
@@ -837,7 +935,23 @@ function drawMap$() {
     ctx.drawImage(entry.canvas, tx, ty, t.dimX * t.res * v.scale, t.dimY * t.res * v.scale);
   }
 
-  // sweep path
+  // robot path trail (history of poses)
+  const trail = state.trail;
+  if (trail && trail.length > 1) {
+    ctx.strokeStyle = 'rgba(62,166,255,.85)';
+    ctx.lineWidth = Math.max(1.5, 0.025 * v.scale);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let i = 0; i < trail.length; i++) {
+      const sx = v.ox + (trail[i].x - b.minX) * v.scale;
+      const sy = v.oy + (trail[i].y - b.minY) * v.scale;
+      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    }
+    ctx.stroke();
+  }
+
+  // sweep path (robot-reported planned/executed path for this action)
   const act = state.action;
   if (act && Array.isArray(act.pt)) {
     ctx.strokeStyle = 'rgba(62,166,255,.5)';
@@ -851,15 +965,9 @@ function drawMap$() {
     ctx.stroke();
   }
 
-  // dock / charging station
+  // dock / charging station (home base)
   if (state.dock) {
-    const d = worldToScreen(state.dock.x, state.dock.y);
-    ctx.save();
-    ctx.translate(d.x, d.y);
-    ctx.rotate(state.dock.yaw || 0);
-    ctx.fillStyle = '#7de0a3';
-    ctx.fillRect(-0.10 * v.scale, -0.07 * v.scale, 0.20 * v.scale, 0.14 * v.scale);
-    ctx.restore();
+    drawDock(ctx, v, state.dock);
   }
 
   // robot pose
@@ -1327,6 +1435,8 @@ function clearState() {
   state.mapCache = new Map();
   state.worldBounds = null;
   state.pose = null;
+  state.trail = [];
+  state._mapLogged = false;
   state.action = null;
   state.device = null;
   state.devices = [];
@@ -1437,6 +1547,10 @@ function init() {
   setWallBank();
   renderWifi();
   log('build ' + APP_VER);
+  try {
+    const st = MapRLE.selfTest();
+    log('decoder self-test: ' + (st.ok ? 'PASS' : 'FAIL') + ' ' + st.detail);
+  } catch (e) { log('decoder self-test threw: ' + e.message); }
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js')
       .then(() => log('service worker ready'))
@@ -1471,6 +1585,24 @@ function init() {
   });
 
   window.addEventListener('resize', () => { if (state.view.fit) fitView(); drawMap$(); });
+
+  const ccBtn = $('btn-clear-cache');
+  if (ccBtn) ccBtn.addEventListener('click', async () => {
+    ccBtn.disabled = true;
+    ccBtn.textContent = 'Clearing…';
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if (self.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+    } catch (e) { /* ignore */ }
+    location.reload(true);
+  });
+
   bootstrap();
 }
 

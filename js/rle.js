@@ -92,5 +92,24 @@
     return '#eef1f6';
   }
 
-  global.MapRLE = { decodeRLE, decodeMapMessage, base64ToBytes, cellToColor };
+  // Known-answer self test so we can prove at runtime whether the *loaded*
+  // decoder is correct (catches stale caches serving an old rle.js).
+  function selfTest() {
+    // "RLE", marker=0x81, prev=0x7f, outLen=3 (LE), then run(marker,2,0x05), literal 0x07
+    const b64 = 'UkxFgX8DAAAAgQIFBw==';
+    const want = [5, 5, 7];
+    try {
+      const g = decodeRLE(base64ToBytes(b64));
+      if (!g) return { ok: false, detail: 'decode returned null' };
+      if (g.length !== want.length) return { ok: false, detail: 'len=' + g.length + ' want ' + want.length };
+      for (let i = 0; i < want.length; i++) {
+        if (g[i] !== want[i]) return { ok: false, detail: '[' + Array.from(g).join(',') + '] want [' + want.join(',') + ']' };
+      }
+      return { ok: true, detail: '[' + Array.from(g).join(',') + ']' };
+    } catch (e) {
+      return { ok: false, detail: 'threw ' + (e && e.message) };
+    }
+  }
+
+  global.MapRLE = { decodeRLE, decodeMapMessage, base64ToBytes, cellToColor, selfTest };
 })(window);
