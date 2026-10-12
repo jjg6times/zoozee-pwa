@@ -234,6 +234,20 @@ main { padding: 14px; display: flex; flex-direction: column; gap: 14px; }
 .wall-row { justify-content: space-between; }
 .status-line.small { font-size: 12px; }
 
+.maplist { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.map-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .02);
+}
+.map-text { flex: 1; min-width: 0; }
+.map-name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctrl.xs { padding: 6px 10px; font-size: 12px; width: auto; margin: 0; }
+
 .sched-form { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
 .sched-form input, .sched-form select {
   padding: 10px;

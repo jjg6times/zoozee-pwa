@@ -20,7 +20,7 @@
         <div class="brand-icon">J</div>
         <h1>Jarvis Remote</h1>
         <p class="sub">ZOOZEE Z70 / Slamtec cloud</p>
-        <p class="ver-stamp">build v32</p>
+        <p class="ver-stamp">build v33</p>
       </div>
       <form id="login-form" autocomplete="on">
         <label>Email / account</label>
@@ -106,6 +106,18 @@
         <p id="wall-status" class="status-line muted small"></p>
         <button class="ctrl warn ghost" id="btn-all-clear">Reset map on robot</button>
         <button class="ctrl ok ghost" id="btn-remap">Reset map + map again</button>
+      </div>
+
+      <div class="panel" id="maps-panel">
+        <div class="panel-title">Maps</div>
+        <div class="opt-row">
+          <button class="ctrl sm" id="btn-save-map">Save current map</button>
+          <button class="ctrl sm" id="btn-load-robot">Load from robot</button>
+          <button class="ctrl sm ok hidden" id="btn-live-map">Back to live</button>
+        </div>
+        <p id="map-label" class="status-line muted small"></p>
+        <div id="saved-maps" class="maplist"></div>
+        <div id="cloud-maps" class="maplist"></div>
       </div>
 
       <div class="panel" id="schedule-panel">

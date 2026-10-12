@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v32';
+const APP_VER = 'v33';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -108,7 +108,11 @@ const state = {
   mqttReconnecting: false,
   mqttConnecting: false,
   maps: [],            // received map tiles: {grid, dimX, dimY, res, realX, realY}
-  mapKind: null,       // 'live' (explore/sweep, while mapping) | 'entire' (17/18)
+  mapKind: null,       // 'live' (explore/sweep, while mapping) | 'entire' (17/18) | 'saved'
+  mapSource: 'live',   // 'live' (robot) | 'saved' (viewing a stored/cloud map)
+  mapLabel: '',        // name of the map currently being viewed
+  savedMaps: [],       // locally saved snapshots: {id,name,savedAt,kind,tiles[]}
+  cloudMaps: [],       // map list fetched from the cloud
   hasEntireMap: false, // true once an ENTIRE (17/18) map has been rendered
   mapCache: new Map(), // tileKey -> {tile, canvas, dirty}
   worldBounds: null,   // {minX,minY,maxX,maxY} in meters
@@ -774,6 +778,9 @@ function trackPose(p) {
 function tileKey(t) { return t.realX + ',' + t.realY + ',' + t.res; }
 
 function storeMapTile(p, kind) {
+  // While viewing a saved/cloud map, ignore live robot tiles until the user
+  // returns to the live layer (otherwise the robot stream overwrites it).
+  if (state.mapSource === 'saved' && kind !== 'saved') return;
   if (!p || !p.map_data) { log('map msg without map_data'); return; }
   const tile = MapRLE.decodeMapMessage(p);
   if (!tile) { log('map decode failed'); return; }
@@ -792,10 +799,11 @@ function storeMapTile(p, kind) {
   const entry = state.mapCache.get(key);
   if (entry) {
     entry.tile = tile;
+    entry.raw = p;
     tileToCanvas(entry);
   } else {
     state.maps.push(tile);
-    const e = { tile, canvas: null };
+    const e = { tile, canvas: null, raw: p };
     tileToCanvas(e);
     state.mapCache.set(key, e);
   }
@@ -1460,6 +1468,8 @@ function clearMapLocal() {
   state.maps = [];
   state.mapCache = new Map();
   state.mapKind = null;
+  state.mapSource = 'live';
+  state.mapLabel = '';
   state.worldBounds = null;
   state.hasEntireMap = false;
   state._lastEntireReq = 0;
@@ -1470,6 +1480,7 @@ function clearMapLocal() {
   if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
   const ms = $('map-status');
   if (ms) ms.textContent = 'Waiting for map…';
+  updateMapSourceUI();
   drawMap$();
 }
 
@@ -1485,6 +1496,196 @@ function resetAndExplore() {
     sendCmd(CMD.START_AUTO_EXPLORING);
     ctrlMsg('map reset — mapping a new floor plan (let it do a full lap)', false);
   }, 3000);
+}
+
+/* ================= saved & cloud maps ================= */
+const SAVED_KEY = 'jarvis.maps';
+
+function loadSavedIndex() {
+  try { state.savedMaps = JSON.parse(localStorage.getItem(SAVED_KEY) || '[]'); }
+  catch (e) { state.savedMaps = []; }
+  if (!Array.isArray(state.savedMaps)) state.savedMaps = [];
+  renderSavedList();
+}
+function persistSavedIndex() {
+  try { localStorage.setItem(SAVED_KEY, JSON.stringify(state.savedMaps)); }
+  catch (e) { ctrlMsg('Could not save map (storage full?)', true); }
+}
+
+function currentPayloads() {
+  const out = [];
+  for (const e of state.mapCache.values()) if (e && e.raw) out.push(e.raw);
+  return out;
+}
+
+function saveCurrentMap() {
+  const payloads = currentPayloads();
+  if (!payloads.length) { ctrlMsg('No map on screen to save yet', true); return; }
+  const def = 'Map ' + new Date().toLocaleString();
+  const name = (window.prompt('Name this map:', state.mapLabel || def) || '').trim();
+  if (!name) return;
+  const snap = {
+    id: 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    name: name.slice(0, 40),
+    savedAt: Date.now(),
+    kind: state.mapKind || 'live',
+    tiles: payloads
+  };
+  state.savedMaps.unshift(snap);
+  if (state.savedMaps.length > 30) state.savedMaps.length = 30;
+  persistSavedIndex();
+  renderSavedList();
+  ctrlMsg('map saved: ' + snap.name, false);
+}
+
+function deleteSavedMap(id) {
+  state.savedMaps = state.savedMaps.filter(s => s.id !== id);
+  persistSavedIndex();
+  renderSavedList();
+}
+
+function loadSavedMap(id) {
+  const snap = state.savedMaps.find(s => s.id === id);
+  if (!snap || !snap.tiles || !snap.tiles.length) { ctrlMsg('saved map is empty', true); return; }
+  const when = new Date(snap.savedAt).toLocaleDateString();
+  showMapFromPayloads(snap.tiles, snap.name + ' · saved ' + when);
+  ctrlMsg('showing saved map: ' + snap.name, false);
+}
+
+function renderSavedList() {
+  const el = $('saved-maps');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!state.savedMaps.length) { el.innerHTML = '<div class="muted small">No saved maps yet.</div>'; return; }
+  for (const s of state.savedMaps) {
+    el.appendChild(mapRow(s.name, new Date(s.savedAt).toLocaleString(), [
+      { label: 'Load', cls: 'xs', fn: () => loadSavedMap(s.id) },
+      { label: '✕', cls: 'xs warn', fn: () => deleteSavedMap(s.id) }
+    ]));
+  }
+}
+
+function mapRow(name, meta, buttons) {
+  const row = document.createElement('div');
+  row.className = 'map-item';
+  const text = document.createElement('div');
+  text.className = 'map-text';
+  const nm = document.createElement('div');
+  nm.className = 'map-name';
+  nm.textContent = name;
+  const mt = document.createElement('div');
+  mt.className = 'muted small';
+  mt.textContent = meta;
+  text.appendChild(nm);
+  text.appendChild(mt);
+  row.appendChild(text);
+  for (const b of buttons) {
+    const btn = document.createElement('button');
+    btn.className = 'ctrl ' + b.cls;
+    btn.textContent = b.label;
+    btn.onclick = b.fn;
+    row.appendChild(btn);
+  }
+  return row;
+}
+
+function cloudNameFor(mapId) {
+  const d = (state.device && state.device.properties) || {};
+  for (const n of [1, 2, 3]) {
+    if (d['fav_map_' + n + '_id'] === mapId) return d['fav_map_' + n + '_name'] || ('Favourite ' + n);
+  }
+  if (state.device && state.device.current_map === mapId) return 'Current map';
+  return null;
+}
+
+async function loadCloudMaps() {
+  const el = $('cloud-maps');
+  if (el) el.innerHTML = '<div class="muted small">Loading…</div>';
+  try {
+    await ensureAccess();
+    const res = await http('/api/maps?user=' + encodeURIComponent(store.email), {
+      headers: { 'Accept': 'application/vnd.slamtec.maplist-v1.0+json' }
+    });
+    if (!res.ok) { if (el) el.innerHTML = '<div class="muted small">HTTP ' + res.status + '</div>'; return; }
+    let list = safeJson(res.body);
+    if (!Array.isArray(list)) list = (list && (list.content || list.maps)) || [];
+    state.cloudMaps = list;
+    renderCloudList();
+    ctrlMsg('found ' + list.length + ' map(s) on the robot', false);
+  } catch (e) {
+    if (el) el.innerHTML = '<div class="muted small">' + (e && e.message) + '</div>';
+  }
+}
+
+function renderCloudList() {
+  const el = $('cloud-maps');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!state.cloudMaps.length) { el.innerHTML = '<div class="muted small">No maps stored on the robot.</div>'; return; }
+  for (const m of state.cloudMaps) {
+    const id = m.map_id || m.id;
+    const name = cloudNameFor(id) || ('Map ' + String(id).slice(0, 8));
+    const meta = (m.dimensionX && m.dimensionY ? m.dimensionX + '×' + m.dimensionY + ' · ' : '') +
+      (m.created ? String(m.created).slice(0, 10) : '');
+    el.appendChild(mapRow(name, meta, [
+      { label: 'Load', cls: 'xs', fn: () => loadCloudMap(id, name) }
+    ]));
+  }
+}
+
+async function loadCloudMap(id, name) {
+  ctrlMsg('loading map from robot…', false);
+  try {
+    await ensureAccess();
+    const metaRes = await http('/api/maps/' + id, {
+      headers: { 'Accept': 'application/vnd.slamtec.map-v1.0+json' }
+    });
+    if (!metaRes.ok) { ctrlMsg('map fetch failed (HTTP ' + metaRes.status + ')', true); return; }
+    const meta = safeJson(metaRes.body) || {};
+    const binRes = await http('/api/maps/' + id + '/binary');
+    if (!binRes.ok) { ctrlMsg('map binary failed (HTTP ' + binRes.status + ')', true); return; }
+    const mapData = (binRes.body || '').replace(/\s+/g, '');
+    if (!mapData) { ctrlMsg('empty map data', true); return; }
+    const payload = {
+      dimension_x: meta.dimensionX, dimension_y: meta.dimensionY,
+      resolution: meta.resolutionX || meta.resolution || 0.05,
+      real_x: meta.realX, real_y: meta.realY,
+      map_data: mapData
+    };
+    showMapFromPayloads([payload], name + ' · robot');
+    ctrlMsg('showing robot map: ' + name, false);
+  } catch (e) {
+    ctrlMsg('map load error: ' + (e && e.message), true);
+  }
+}
+
+/* Render a set of raw map payloads as a standalone (saved/cloud) layer. Live
+   robot tiles are ignored until the user taps "Back to live". */
+function showMapFromPayloads(payloads, label) {
+  state.mapSource = 'saved';
+  state.mapKind = null;   // force storeMapTile to reset the layer cache
+  state.view.fit = true;
+  for (const p of payloads) storeMapTile(p, 'saved');
+  state.mapLabel = label || '';
+  updateMapSourceUI();
+  drawMap$();
+}
+
+function goLiveMap() {
+  state.mapSource = 'live';
+  state.mapLabel = '';
+  clearMapLocal();
+  updateMapSourceUI();
+  requestEntireMap();
+  ctrlMsg('back to live map', false);
+}
+
+function updateMapSourceUI() {
+  const viewing = state.mapSource === 'saved';
+  const label = $('map-label');
+  if (label) label.textContent = viewing ? ('Viewing: ' + (state.mapLabel || 'saved map')) : '';
+  const btn = $('btn-live-map');
+  if (btn) btn.classList.toggle('hidden', !viewing);
 }
 
 function wireControls() {
@@ -1504,6 +1705,9 @@ function wireControls() {
   on('btn-wall-save', saveWalls);
   on('btn-wall-clear', clearWalls);
   on('btn-remap', resetAndExplore);
+  on('btn-save-map', saveCurrentMap);
+  on('btn-load-robot', loadCloudMaps);
+  on('btn-live-map', goLiveMap);
   on('btn-zoom-in', zoomIn);
   on('btn-zoom-out', zoomOut);
   on('btn-zoom-fit', resetView);
@@ -1571,6 +1775,8 @@ function clearState() {
   state.maps = [];
   state.hasEntireMap = false;
   state.mapKind = null;
+  state.mapSource = 'live';
+  state.mapLabel = '';
   state._lastEntireReq = 0;
   state.mapCache = new Map();
   state.worldBounds = null;
@@ -1689,6 +1895,7 @@ function init() {
   setupMap();
   setWallBank();
   renderWifi();
+  loadSavedIndex();
   startPoseTick();
   log('build ' + APP_VER + ' · ' + (typeof MapRLE !== 'undefined' && MapRLE.VER ? MapRLE.VER : 'rle-OLD'));
   try {
