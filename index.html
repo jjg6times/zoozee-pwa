@@ -20,7 +20,7 @@
         <div class="brand-icon">J</div>
         <h1>Jarvis Remote</h1>
         <p class="sub">ZOOZEE Z70 / Slamtec cloud</p>
-        <p class="ver-stamp">build v36</p>
+        <p class="ver-stamp">build v37</p>
       </div>
       <form id="login-form" autocomplete="on">
         <label>Email / account</label>
@@ -132,14 +132,28 @@
         <div class="panel-title">Schedule</div>
         <div id="schedule-list" class="muted">…</div>
         <div class="sched-form">
-          <input id="sched-time" type="time" />
-          <select id="sched-repeat">
-            <option value="MONDAY">Mon</option><option value="TUESDAY">Tue</option>
-            <option value="WEDNESDAY">Wed</option><option value="THURSDAY">Thu</option>
-            <option value="FRIDAY">Fri</option><option value="SATURDAY">Sat</option>
-            <option value="SUNDAY">Sun</option>
-          </select>
-          <button id="btn-add-sched">Add</button>
+          <div class="sched-days" id="sched-days"></div>
+          <div class="sched-presets" id="sched-presets">
+            <button type="button" class="chip" data-mask="127">Every day</button>
+            <button type="button" class="chip" data-mask="62">Weekdays</button>
+            <button type="button" class="chip" data-mask="65">Weekends</button>
+            <button type="button" class="chip" data-mask="0">Once</button>
+          </div>
+          <div class="sched-row">
+            <input id="sched-time" type="time" />
+            <select id="sched-task">
+              <option value="sweep">Sweep</option>
+              <option value="smart">Smart</option>
+            </select>
+            <select id="sched-duration">
+              <option value="360">Unlimited</option>
+              <option value="30">30 min</option>
+              <option value="60">60 min</option>
+              <option value="90">90 min</option>
+              <option value="120">120 min</option>
+            </select>
+          </div>
+          <button class="ctrl" id="btn-add-sched">Add schedule</button>
         </div>
         <p id="sched-msg" class="msg"></p>
       </div>

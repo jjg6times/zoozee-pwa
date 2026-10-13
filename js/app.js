@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v36';
+const APP_VER = 'v37';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -1583,9 +1583,77 @@ function toggleSpot() {
 }
 
 /* ================= schedules ================= */
+const DOW_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const DOW_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DAY_BITS = { SUNDAY: 1, MONDAY: 2, TUESDAY: 4, WEDNESDAY: 8, THURSDAY: 16, FRIDAY: 32, SATURDAY: 64 };
+
+function daysFromMask(mask) {
+  const out = [];
+  for (let i = 0; i < 7; i++) if (mask & (1 << i)) out.push(i);
+  return out;
+}
+function describeDays(repeat) {
+  const r = repeat || 0;
+  if (!r) return 'Once';
+  if (r === 127) return 'Every day';
+  if (r === 62) return 'Weekdays';
+  if (r === 65) return 'Weekends';
+  return daysFromMask(r).map((i) => DOW_SHORT[i]).join(', ') || ('b' + r);
+}
+function taskLabel(t) {
+  return t === 'sweep' ? 'Sweep' : t === 'smart' ? 'Smart' : t === 'region' ? 'Region' : (t || 'Task');
+}
+function durationLabel(min) {
+  const m = min || 0;
+  return m >= 360 ? 'Unlimited' : (m ? m + ' min' : '—');
+}
+
+function parseStartDate(s) {
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?([+-]\d{2}):?(\d{2})?$/.exec(s);
+  if (!m) { const d = new Date(s); return isNaN(d.getTime()) ? null : d; }
+  const off = (m[8][0] === '-' ? -1 : 1) * (Math.abs(parseInt(m[8], 10)) * 60 + (m[9] ? parseInt(m[9], 10) : 0));
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], m[6] ? +m[6] : 0, m[7] ? +m[7].slice(0, 3) : 0) - off * 60000);
+}
+function fmtClock(d) {
+  let h = d.getHours();
+  const ap = h >= 12 ? 'PM' : 'AM';
+  h = h % 12; if (!h) h = 12;
+  return h + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ap;
+}
+function fmtWhen(d) {
+  const now = new Date();
+  const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = (midnight(d) - midnight(now)) / 86400000;
+  const day = diff === 0 ? 'today' : diff === 1 ? 'tomorrow' : DOW_SHORT[d.getDay()];
+  return day + ' ' + fmtClock(d);
+}
+function nextRunFor(repeat, base) {
+  if (!base) return null;
+  const now = new Date();
+  const hh = base.getHours(), mm = base.getMinutes();
+  if (!repeat) return base.getTime() > now.getTime() ? base : null;
+  const days = daysFromMask(repeat);
+  for (let i = 0; i < 8; i++) {
+    const d = new Date(now);
+    d.setDate(now.getDate() + i);
+    d.setHours(hh, mm, 0, 0);
+    if (d.getTime() > now.getTime() && days.indexOf(d.getDay()) !== -1) return d;
+  }
+  return null;
+}
+
+function schedMessage(text, kind) {
+  const el = $('sched-msg');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'msg' + (kind === true ? ' ok' : kind === false ? ' err' : '');
+}
+
 async function refreshSchedules() {
-  if (!state.device) return;
   const listEl = $('schedule-list');
+  if (!listEl || !state.device) return;
+  listEl.className = 'muted';
   listEl.textContent = '…';
   try {
     await ensureAccess();
@@ -1596,68 +1664,145 @@ async function refreshSchedules() {
     if (!res.ok) { listEl.textContent = 'HTTP ' + res.status; return; }
     const j = JSON.parse(res.body);
     const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
-    if (!items.length) { listEl.textContent = 'No scheduled tasks'; return; }
-    listEl.innerHTML = '';
-    for (const it of items) {
-      const row = document.createElement('div');
-      row.className = 'item';
-      const text = document.createElement('span');
-      text.textContent = `${it.task || '?'} · ${(it.start_date || '').replace('T', ' ').slice(0, 16)} · repeat=${it.repeat ?? 0}${it.enabled === false ? ' · OFF' : ''}`;
-      const del = document.createElement('button');
-      del.className = 'del';
-      del.textContent = '✕';
-      del.onclick = () => deleteSchedule(it.scheduled_task_id);
-      row.appendChild(text);
-      row.appendChild(del);
-      listEl.appendChild(row);
-    }
+    if (!items.length) { listEl.textContent = 'No scheduled tasks yet.'; return; }
+    listEl.className = '';
+    listEl.textContent = '';
+    for (const it of items) listEl.appendChild(scheduleRow(it));
   } catch (err) {
+    listEl.className = 'muted';
     listEl.textContent = err.message;
   }
 }
 
+function scheduleRow(it) {
+  const row = document.createElement('div');
+  row.className = 'map-item';
+  const box = document.createElement('div');
+  box.className = 'map-text';
+  const base = parseStartDate(it.start_date);
+  const title = document.createElement('div');
+  title.className = 'map-name';
+  title.textContent = taskLabel(it.task) + ' · ' + (base ? fmtClock(base) : (it.start_date || '—'));
+  if (it.enabled === false) {
+    const off = document.createElement('span');
+    off.className = 'tag-off';
+    off.textContent = 'OFF';
+    title.appendChild(document.createTextNode(' '));
+    title.appendChild(off);
+  }
+  const meta = document.createElement('div');
+  meta.className = 'status-line small muted';
+  const next = nextRunFor(it.repeat || 0, base);
+  const bits = [describeDays(it.repeat), durationLabel(it.max_duration_in_minutes)];
+  if ((it.repeat || 0) === 0) bits.push(base && next ? 'scheduled' : 'passed');
+  else if (next) bits.push('next ' + fmtWhen(next));
+  meta.textContent = bits.join(' · ');
+  box.appendChild(title);
+  box.appendChild(meta);
+  const del = document.createElement('button');
+  del.className = 'ctrl xs warn';
+  del.textContent = '✕';
+  del.title = 'Delete schedule';
+  del.onclick = () => deleteSchedule(it.scheduled_task_id);
+  row.appendChild(box);
+  row.appendChild(del);
+  return row;
+}
+
 async function deleteSchedule(taskId) {
+  if (!taskId) return;
+  if (!window.confirm('Delete this schedule?')) return;
   const id = state.deviceId;
-  const res = await http('/api/devices/' + id + '/scheduled-tasks/' + taskId, { method: 'DELETE' });
-  $('sched-msg').textContent = res.ok ? 'deleted' : ('HTTP ' + res.status);
+  try {
+    const res = await http('/api/devices/' + id + '/scheduled-tasks/' + encodeURIComponent(taskId), { method: 'DELETE' });
+    schedMessage(res.ok ? 'Deleted.' : ('Delete failed: HTTP ' + res.status), res.ok);
+  } catch (e) {
+    schedMessage(e.message, false);
+  }
   refreshSchedules();
 }
 
 async function addSchedule() {
-  const t = $('sched-time').value;
-  if (!t) { $('sched-msg').textContent = 'pick a time first'; return; }
-  const repeatStr = $('sched-repeat').value;
-  const repeat = DAY_BITS[repeatStr];
-  const start_date = localStartDate(t);
-  const body = {
-    task: 'sweep',
-    start_date,
-    enabled: true,
-    repeat,
-    max_duration_in_minutes: 360
-  };
-  const id = state.deviceId;
-  const res = await http('/api/devices/' + id + '/scheduled-tasks', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
-               'Accept': 'application/vnd.slamtec.scheduledtask-v1.0+json' },
-    body: JSON.stringify(body)
-  });
-  $('sched-msg').textContent = res.ok ? 'added ' + start_date : ('HTTP ' + res.status + ' ' + res.body.slice(0, 120));
-  refreshSchedules();
+  const t = $('sched-time') ? $('sched-time').value : '';
+  if (!t) { schedMessage('Pick a time first.', false); return; }
+  const days = state.schedDays ? Array.from(state.schedDays) : [];
+  const repeat = days.reduce((n, i) => n | (1 << i), 0);
+  const task = ($('sched-task') && $('sched-task').value) || 'sweep';
+  const dur = parseInt(($('sched-duration') && $('sched-duration').value) || '360', 10);
+  const start_date = startDateFor(t, repeat === 0);
+  const btn = $('btn-add-sched');
+  if (btn) btn.disabled = true;
+  schedMessage('Adding…');
+  try {
+    await ensureAccess();
+    const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
+                 'Accept': 'application/vnd.slamtec.scheduledtasklist-v1.0+json' },
+      body: JSON.stringify({ task, start_date, enabled: true, repeat, max_duration_in_minutes: dur })
+    });
+    if (res.ok) {
+      schedMessage('Added: ' + taskLabel(task) + ' · ' + describeDays(repeat) + ' at ' + t + '.', true);
+      refreshSchedules();
+    } else {
+      schedMessage('Add failed: HTTP ' + res.status + ' ' + String(res.body).slice(0, 100), false);
+    }
+  } catch (e) {
+    schedMessage(e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
-const DAY_BITS = { MONDAY: 2, TUESDAY: 4, WEDNESDAY: 8, THURSDAY: 16, FRIDAY: 32, SATURDAY: 64, SUNDAY: 1 };
-
-function localStartDate(t) {
-  const d = new Date();
+function startDateFor(t, isOnce) {
   const [hh, mm] = t.split(':').map(Number);
-  d.setHours(hh, mm, 0, 0);
-  const pad = (n, l = 2) => String(n).padStart(l, '0');
+  const d = new Date();
+  d.setHours(hh || 0, mm || 0, 0, 0);
+  if (isOnce && d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+  const pad = (n) => String(n).padStart(2, '0');
   const off = -d.getTimezoneOffset();
   const sign = off >= 0 ? '+' : '-';
   const offAbs = Math.abs(off);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:00.000${sign}${pad(Math.floor(offAbs / 60))}${pad(offAbs % 60)}`;
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':00.000' +
+    sign + pad(Math.floor(offAbs / 60)) + pad(offAbs % 60);
+}
+
+function setSchedDays(mask) {
+  state.schedDays = new Set(daysFromMask(mask));
+  buildSchedDays();
+}
+function schedMask() {
+  let m = 0;
+  if (state.schedDays) state.schedDays.forEach((i) => { m |= (1 << i); });
+  return m;
+}
+function buildSchedDays() {
+  const box = $('sched-days');
+  if (!box) return;
+  if (!state.schedDays) state.schedDays = new Set([new Date().getDay()]);
+  box.textContent = '';
+  DOW_SHORT.forEach((label, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'day' + (state.schedDays.has(i) ? ' on' : '');
+    b.textContent = label;
+    b.title = DOW_FULL[i];
+    b.onclick = () => {
+      if (state.schedDays.has(i)) state.schedDays.delete(i); else state.schedDays.add(i);
+      b.classList.toggle('on', state.schedDays.has(i));
+      updateSchedPresets();
+      schedMessage('');
+    };
+    box.appendChild(b);
+  });
+  updateSchedPresets();
+}
+function updateSchedPresets() {
+  const box = $('sched-presets');
+  if (!box) return;
+  const m = schedMask();
+  box.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', +c.dataset.mask === m));
 }
 
 /* ================= controls ================= */
@@ -2159,9 +2304,14 @@ function wireControls() {
   on('btn-zoom-fit', resetView);
   on('btn-map-refresh', () => requestEntireMap(true));
   on('btn-add-sched', addSchedule);
+  buildSchedDays();
+  const presetBox = $('sched-presets');
+  if (presetBox) presetBox.querySelectorAll('.chip').forEach((c) => { c.onclick = () => { setSchedDays(+c.dataset.mask); schedMessage(''); }; });
   on('btn-logout', logout);
   on('btn-copy-log', copyDiag);
-  onEvent('sched-time', 'change', () => $('sched-msg').textContent = '');
+  onEvent('sched-time', 'change', () => schedMessage(''));
+  onEvent('sched-task', 'change', () => schedMessage(''));
+  onEvent('sched-duration', 'change', () => schedMessage(''));
   onEvent('carpet-boost', 'change', (e) => toggleCarpetBoost(!!e.target.checked));
   on('btn-check-now', async () => {
     const btn = $('btn-check-now');
