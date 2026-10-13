@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v39';
+const APP_VER = 'v40';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -2465,8 +2465,6 @@ function clearState() {
   if (sp) sp.textContent = 'Spot region';
   const wb = $('btn-wall');
   if (wb) { wb.textContent = '＋ Wall'; wb.classList.remove('active'); }
-  const nb = $('btn-nogo');
-  if (nb) { nb.textContent = '＋ Zone'; nb.classList.remove('active'); }
   const nb = $('btn-nogo');
   if (nb) { nb.textContent = '＋ Zone'; nb.classList.remove('active'); }
   setNoGoBank();
