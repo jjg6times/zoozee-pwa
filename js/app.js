@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v37';
+const APP_VER = 'v38';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -567,6 +567,7 @@ function setCtrlEnabled(on) {
 function sendCmd(f, p) {
   const m = state.mqtt;
   if (!m.connected) { ctrlMsg('Not connected (robot offline?)', true); return; }
+  if (!state.deviceId) { ctrlMsg('No robot selected', true); return; }
   const payload = JSON.stringify(p === undefined || p === null ? { f } : { f, p });
   m.publish('device/' + state.deviceId + '/robot', strToBytes(payload));
   ctrlMsg('sent f=' + f, false);
@@ -688,7 +689,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.CURRENT_ACTION:
       state.action = p;
       renderStatus();
-      drawMap$();
+      if (state.mapSource !== 'saved') drawMap$();
       break;
     case TYPE.BATTERY_PERCENTAGE:
       state.battery = num(p.progress != null ? p.progress : p);
@@ -720,7 +721,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.DOCK_POSE:
       if (p && typeof p === 'object') {
         state.dock = { x: num(p.x), y: num(p.y), yaw: num(p.yaw) };
-        drawMap$();
+        if (state.mapSource !== 'saved') drawMap$();
       }
       break;
     case TYPE.SWEEP_TIME:
@@ -770,6 +771,16 @@ function handleAppMessage(topic, payload, raw) {
       // layer so they never mix with the complete (17/18) map.
       state._lastMapMsg = Date.now();
       queueLive(p);
+      break;
+    case TYPE.ROBOTTRACK:
+      // High-rate robot-reported path (not needed for the UI — the pose/trail
+      // already covers it). Swallow it so it can't flood the debug log.
+      break;
+    case TYPE.HELLO:
+      if (!state._helloLogged) { state._helloLogged = true; log('robot HELLO'); }
+      break;
+    case TYPE.SWEEP_REGION:
+    case TYPE.SWEEPING_REGION:
       break;
     default:
       log('rx f=' + f + ' ' + bytesToStr(payload).slice(0, 160));
@@ -877,6 +888,14 @@ function storeMapTile(p, kind) {
     const e = { tile, canvas: null, raw: p };
     tileToCanvas(e);
     state.mapCache.set(key, e);
+  }
+  // Safety valve: a runaway tile stream must never exhaust memory. Normal maps
+  // are 1-4 tiles, so this only triggers on anomalous data.
+  if (state.mapCache.size > 512) {
+    const keep = state.mapCache.get(key);
+    state.mapCache = new Map([[key, keep]]);
+    state.maps = [tile];
+    state.worldBounds = null;
   }
   state._mapVer++;
   const minX = tile.realX, minY = tile.realY;
@@ -1073,6 +1092,7 @@ function drawDock(ctx, v, dock) {
 /* Coalesce map repaints: POSE streaming at ~10 Hz used to trigger a full canvas
    redraw per message. Now at most one redraw per animation frame. */
 let _mapRaf = 0;
+let _mapCtx = null;
 function drawMap$() {
   if (_mapRaf) return;
   _mapRaf = requestAnimationFrame(() => { _mapRaf = 0; renderMap(); });
@@ -1080,7 +1100,7 @@ function drawMap$() {
 
 function renderMap() {
   const canvas = $('map');
-  const ctx = canvas.getContext('2d');
+  const ctx = _mapCtx || (_mapCtx = canvas.getContext('2d'));
   const dpr = window.devicePixelRatio || 1;
   const W = canvas.clientWidth, H = canvas.clientHeight;
   if (W === 0 || H === 0) return;
@@ -1157,8 +1177,10 @@ function renderMap() {
   }
 
   // draft walls / no-go box (committed ones are baked into the static layer)
-  drawWalls(ctx, v, b, state.wallDraft && state.wallDraft.x1 !== undefined ? state.wallDraft : null, true);
-  drawNoGo(ctx, v, b, state.noGoDraft && state.noGoDraft.x1 !== undefined ? state.noGoDraft : null, true);
+  if (state.mapSource !== 'saved') {
+    drawWalls(ctx, v, b, state.wallDraft && state.wallDraft.x1 !== undefined ? state.wallDraft : null, true);
+    drawNoGo(ctx, v, b, state.noGoDraft && state.noGoDraft.x1 !== undefined ? state.noGoDraft : null, true);
+  }
 
   // spot region selection
   if (state.spot && state.spotCur) {
@@ -1231,7 +1253,7 @@ let _sc = null, _scx = null, _scKey = '';
 function staticLayerKey(W, H, dpr, v, b) {
   return [W, H, dpr, v.scale.toFixed(4), v.ox.toFixed(2), v.oy.toFixed(2),
     b.minX, b.minY, b.maxX, b.maxY,
-    state._mapVer || 0, state._wallVer || 0, state._nogoVer || 0].join('|');
+    state.mapSource, state._mapVer || 0, state._wallVer || 0, state._nogoVer || 0].join('|');
 }
 function buildStaticLayer(W, H, dpr, v, b) {
   if (!_sc) { _sc = document.createElement('canvas'); _scx = _sc.getContext('2d'); }
@@ -1257,8 +1279,12 @@ function buildStaticLayer(W, H, dpr, v, b) {
   // subtle border around the mapped area
   c.strokeStyle = 'rgba(125,146,186,.28)'; c.lineWidth = 1;
   roundRect(c, mx, my, mw, mh, 10); c.stroke();
-  drawWalls(c, v, b, null);
-  drawNoGo(c, v, b, null);
+  // Committed walls/no-go belong to the live robot frame — never bake them over
+  // a stored/cloud map (different frame), or they'd appear in the wrong place.
+  if (state.mapSource !== 'saved') {
+    drawWalls(c, v, b, null);
+    drawNoGo(c, v, b, null);
+  }
   _scKey = staticLayerKey(W, H, dpr, v, b);
   return _sc;
 }
@@ -1624,7 +1650,7 @@ function fmtClock(d) {
 function fmtWhen(d) {
   const now = new Date();
   const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  const diff = (midnight(d) - midnight(now)) / 86400000;
+  const diff = Math.round((midnight(d) - midnight(now)) / 86400000);
   const day = diff === 0 ? 'today' : diff === 1 ? 'tomorrow' : DOW_SHORT[d.getDay()];
   return day + ' ' + fmtClock(d);
 }
@@ -1729,7 +1755,7 @@ async function addSchedule() {
   const repeat = days.reduce((n, i) => n | (1 << i), 0);
   const task = ($('sched-task') && $('sched-task').value) || 'sweep';
   const dur = parseInt(($('sched-duration') && $('sched-duration').value) || '360', 10);
-  const start_date = startDateFor(t, repeat === 0);
+  const start_date = startDateFor(t, repeat);
   const btn = $('btn-add-sched');
   if (btn) btn.disabled = true;
   schedMessage('Adding…');
@@ -1754,11 +1780,22 @@ async function addSchedule() {
   }
 }
 
-function startDateFor(t, isOnce) {
+function startDateFor(t, mask) {
   const [hh, mm] = t.split(':').map(Number);
   const d = new Date();
   d.setHours(hh || 0, mm || 0, 0, 0);
-  if (isOnce && d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+  if (!mask) {
+    // one-shot → the next occurrence of this clock time
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+  } else {
+    // repeating → the first selected weekday at/after now (keeps the stored
+    // start_date consistent with the "next run" shown in the UI)
+    const days = daysFromMask(mask);
+    let guard = 0;
+    while ((d.getTime() <= Date.now() || days.indexOf(d.getDay()) === -1) && guard++ < 8) {
+      d.setDate(d.getDate() + 1);
+    }
+  }
   const pad = (n) => String(n).padStart(2, '0');
   const off = -d.getTimezoneOffset();
   const sign = off >= 0 ? '+' : '-';
@@ -2430,7 +2467,19 @@ function clearState() {
   if (wb) { wb.textContent = '＋ Wall'; wb.classList.remove('active'); }
   const nb = $('btn-nogo');
   if (nb) { nb.textContent = '＋ Zone'; nb.classList.remove('active'); }
+  const nb = $('btn-nogo');
+  if (nb) { nb.textContent = '＋ Zone'; nb.classList.remove('active'); }
   setNoGoBank();
+  // Per-account/session state that also lives in the DOM.
+  state.cloudMaps = [];
+  state._cloudBusy = false;
+  state._cloudCap = 20;
+  state._helloLogged = false;
+  state.schedDays = null;
+  const cl = $('cloud-maps'); if (cl) cl.innerHTML = '';
+  const sl = $('schedule-list');
+  if (sl) { sl.className = 'muted'; sl.textContent = '…'; }
+  buildSchedDays();
 }
 
 function logout() {
