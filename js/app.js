@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v40';
+const APP_VER = 'v41';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -1764,8 +1764,8 @@ async function addSchedule() {
     const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
-                 'Accept': 'application/vnd.slamtec.scheduledtasklist-v1.0+json' },
-      body: JSON.stringify({ task, start_date, enabled: true, repeat, max_duration_in_minutes: dur })
+                 'Accept': 'application/vnd.slamtec.scheduledtask-v1.0+json' },
+      body: JSON.stringify({ task, start_date, enabled: true, repeat, max_duration_in_minutes: dur, version: 0 })
     });
     if (res.ok) {
       schedMessage('Added: ' + taskLabel(task) + ' · ' + describeDays(repeat) + ' at ' + t + '.', true);
