@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v42';
+const APP_VER = 'v43';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -26,7 +26,7 @@ const CMD = {
   UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
   GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42,
   GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
-  UPDATE_SWEEP_REGION: 67
+  UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -133,6 +133,8 @@ const state = {
   _headDone: false,
   history: [],         // cleaning history [{ts,type,durSec,areaM2,sweepSec}]
   cloudHistory: [],    // cleaning runs fetched from the cloud task API
+  robotTz: null,       // robot's configured IANA time zone
+  phoneTz: null,       // this device's IANA time zone
   run: null,           // currently-observed cleaning run
   action: null,        // {an,st,pt,ms}
   battery: null,
@@ -1677,6 +1679,66 @@ function schedMessage(text, kind) {
   el.className = 'msg' + (kind === true ? ' ok' : kind === false ? ' err' : '');
 }
 
+function phoneTimeZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch (e) { return null; }
+}
+function renderTzNote() {
+  const el = $('sched-tz');
+  if (!el) return;
+  const phone = state.phoneTz || phoneTimeZone();
+  const robot = state.robotTz;
+  if (!phone) { el.textContent = ''; return; }
+  if (!robot) { el.className = 'status-line muted small'; el.textContent = 'Time zone: ' + phone; return; }
+  if (robot === phone) {
+    el.className = 'status-line muted small';
+    el.textContent = 'Time zone: ' + phone + ' (phone and robot match)';
+  } else {
+    el.className = 'status-line small';
+    el.textContent = 'Time zone mismatch — robot "' + robot + '" vs phone "' + phone + '". Fixing…';
+  }
+}
+async function syncRobotTimezone() {
+  const tz = phoneTimeZone();
+  state.phoneTz = tz;
+  if (!tz || !state.deviceId) { renderTzNote(); return false; }
+  const props = (state.device && state.device.properties) || {};
+  let current = props.time_zone || state.robotTz || null;
+  try {
+    await ensureAccess();
+    const res = await http('/api/devices/' + state.deviceId + '/properties', {
+      headers: { 'Accept': 'application/vnd.slamtec.deviceproperty-v1.0+json' }
+    });
+    if (res.ok) {
+      const j = JSON.parse(res.body);
+      const p = (j && j.properties) || j || {};
+      if (p.time_zone) current = p.time_zone;
+      if (state.device) state.device.properties = Object.assign({}, props, p);
+    }
+  } catch (e) { /* keep cached value */ }
+  state.robotTz = current;
+  renderTzNote();
+  if (current === tz) return true;
+  try {
+    const res = await http('/api/devices/' + state.deviceId + '/properties', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/vnd.slamtec.deviceproperty-v1.0+json',
+                 'Accept': 'application/vnd.slamtec.deviceproperty-v1.0+json' },
+      body: JSON.stringify({ device_id: state.deviceId, properties: { time_zone: tz } })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (state.device) state.device.properties.time_zone = tz;
+    state.robotTz = tz;
+    if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SET_TIMEZONE, { time_zone: tz });
+    log('robot time zone set to ' + tz);
+    renderTzNote();
+    return true;
+  } catch (e) {
+    log('time zone sync failed: ' + e.message);
+    renderTzNote();
+    return false;
+  }
+}
+
 async function refreshSchedules() {
   const listEl = $('schedule-list');
   if (!listEl || !state.device) return;
@@ -1762,6 +1824,7 @@ async function addSchedule() {
   schedMessage('Adding…');
   try {
     await ensureAccess();
+    await syncRobotTimezone();
     const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
@@ -2466,6 +2529,8 @@ function clearState() {
   if (state.run) finalizeRun();
   state.history = [];
   state.cloudHistory = [];
+  state.robotTz = null;
+  state.phoneTz = null;
   state.maps = [];
   state.hasEntireMap = false;
   state.mapKind = null;
@@ -2591,6 +2656,7 @@ async function enterMain() {
     startStatusPoll();
     refreshSchedules();
     loadCloudHistory();
+    syncRobotTimezone();
     if (state.deviceId) ctrlMsg('', false);
   } catch (err) {
     $('dev-sub').textContent = err.message;
