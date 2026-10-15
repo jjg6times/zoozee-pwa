@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v41';
+const APP_VER = 'v42';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -132,6 +132,7 @@ const state = {
   _headN: 0,
   _headDone: false,
   history: [],         // cleaning history [{ts,type,durSec,areaM2,sweepSec}]
+  cloudHistory: [],    // cleaning runs fetched from the cloud task API
   run: null,           // currently-observed cleaning run
   action: null,        // {an,st,pt,ms}
   battery: null,
@@ -2212,6 +2213,53 @@ function loadHistory() {
   if (!Array.isArray(state.history)) state.history = [];
   renderHistory();
 }
+function taskTypeLabel(t) {
+  t = String(t || '');
+  if (/sweep/i.test(t)) return 'Sweep';
+  if (/map|explor/i.test(t)) return 'Mapping';
+  if (/spot/i.test(t)) return 'Spot';
+  if (/edge/i.test(t)) return 'Edge';
+  if (/goto/i.test(t)) return 'GoTo';
+  return t.replace(/Action$/, '') || 'Task';
+}
+function parseCloudTask(e) {
+  const start = Date.parse(e.started_time || e.created || e.last_updated || '') || 0;
+  const end = Date.parse(e.finished_time || e.last_updated || e.created || '') || start;
+  return {
+    taskId: e.task_id || null,
+    ts: start,
+    type: taskTypeLabel(e.task),
+    durSec: Math.max(0, Math.round((end - start) / 1000)),
+    areaM2: 0,
+    status: e.status || '',
+    batt: null,
+    src: 'cloud'
+  };
+}
+async function loadCloudHistory() {
+  if (!state.deviceId || !store.refresh) return;
+  try {
+    await ensureAccess();
+    const res = await http('/api/devices/' + state.deviceId + '/tasks', {
+      headers: { 'Accept': 'application/vnd.slamtec.tasklist-v1.0+json' }
+    });
+    if (!res.ok) return;
+    const j = JSON.parse(res.body);
+    const items = Array.isArray(j) ? j : (j.content || j.tasks || j.data || []);
+    state.cloudHistory = items.map(parseCloudTask).filter(t => t.ts);
+    renderHistory();
+  } catch (e) { /* offline or no cloud history */ }
+}
+function historyList() {
+  const list = state.history.slice();
+  for (const c of (state.cloudHistory || [])) {
+    if (!c.ts) continue;
+    const dup = list.some(l => l.type === c.type && Math.abs((l.ts || 0) - c.ts) < 120000);
+    if (!dup) list.push(c);
+  }
+  list.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return list;
+}
 function persistHistory() {
   try { localStorage.setItem(historyKey(), JSON.stringify(state.history)); } catch (e) { /* noop */ }
 }
@@ -2268,6 +2316,7 @@ function finalizeRun() {
   if (state.history.length > 50) state.history.length = 50;
   persistHistory();
   renderHistory();
+  loadCloudHistory();
 }
 function fmtDur(sec) {
   sec = Math.round(sec || 0);
@@ -2279,15 +2328,16 @@ function renderHistory() {
   const sum = $('history-summary');
   if (!el) return;
   el.innerHTML = '';
-  if (!state.history.length) {
+  const list = historyList();
+  if (!list.length) {
     el.innerHTML = '<div class="muted small">No cleaning recorded yet. Runs are logged automatically while sweeping, mapping, spot or edge cleaning.</div>';
     if (sum) sum.textContent = '';
     return;
   }
   let area = 0, dur = 0;
-  for (const e of state.history) { area += e.areaM2 || 0; dur += e.durSec || 0; }
-  if (sum) sum.textContent = state.history.length + ' runs · ' + area.toFixed(1) + ' m² · ' + fmtDur(dur) + ' total';
-  for (const e of state.history) {
+  for (const e of list) { area += e.areaM2 || 0; dur += e.durSec || 0; }
+  if (sum) sum.textContent = list.length + ' runs · ' + area.toFixed(1) + ' m² · ' + fmtDur(dur) + ' total';
+  for (const e of list) {
     const row = document.createElement('div');
     row.className = 'map-item';
     const txt = document.createElement('div');
@@ -2295,6 +2345,13 @@ function renderHistory() {
     const nm = document.createElement('div');
     nm.className = 'map-name';
     nm.textContent = e.type + '  ·  ' + new Date(e.ts).toLocaleString();
+    if (e.status && e.status !== 'Finished') {
+      const tag = document.createElement('span');
+      tag.className = 'tag-off';
+      tag.textContent = e.status.toUpperCase();
+      nm.appendChild(document.createTextNode(' '));
+      nm.appendChild(tag);
+    }
     const mt = document.createElement('div');
     mt.className = 'muted small';
     mt.textContent = (e.areaM2 ? e.areaM2 + ' m²' : '—') + '  ·  ' + fmtDur(e.sweepSec || e.durSec) + (e.batt != null ? '  ·  ' + e.batt + '%' : '');
@@ -2408,6 +2465,7 @@ function show(id) {
 function clearState() {
   if (state.run) finalizeRun();
   state.history = [];
+  state.cloudHistory = [];
   state.maps = [];
   state.hasEntireMap = false;
   state.mapKind = null;
@@ -2532,6 +2590,7 @@ async function enterMain() {
     pingLoop();
     startStatusPoll();
     refreshSchedules();
+    loadCloudHistory();
     if (state.deviceId) ctrlMsg('', false);
   } catch (err) {
     $('dev-sub').textContent = err.message;
