@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v43';
+const APP_VER = 'v44';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -26,7 +26,7 @@ const CMD = {
   UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
   GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42,
   GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
-  UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106
+  UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106, SYNC_SCHEDULE_TASK: 31
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -1808,6 +1808,7 @@ async function deleteSchedule(taskId) {
   } catch (e) {
     schedMessage(e.message, false);
   }
+  try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
   refreshSchedules();
 }
 
@@ -1833,6 +1834,7 @@ async function addSchedule() {
     });
     if (res.ok) {
       schedMessage('Added: ' + taskLabel(task) + ' · ' + describeDays(repeat) + ' at ' + t + '.', true);
+      try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
       refreshSchedules();
     } else {
       schedMessage('Add failed: HTTP ' + res.status + ' ' + String(res.body).slice(0, 100), false);
