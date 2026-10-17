@@ -21,7 +21,7 @@
         <div class="brand-icon">J</div>
         <h1>Jarvis Remote</h1>
         <p class="sub">ZOOZEE Z70 / Slamtec cloud</p>
-        <p class="ver-stamp">build v44</p>
+        <p class="ver-stamp">build v45</p>
       </div>
       <form id="login-form" autocomplete="on">
         <label>Email / account</label>
@@ -99,6 +99,16 @@
           <label for="carpet-boost">Carpet boost (auto suction)</label>
           <input id="carpet-boost" type="checkbox" disabled />
         </div>
+        <div class="opt-row">
+          <label for="voice-id">Voice ID</label>
+          <input id="voice-id" type="text" placeholder="voice_id" style="flex:1;padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);font-size:13px;" />
+        </div>
+        <div class="opt-row" style="gap:8px;flex-wrap:wrap;">
+          <button id="btn-voice-get" class="ctrl xs">Get Voice</button>
+          <button id="btn-voice-set" class="ctrl xs">Set Voice</button>
+          <span id="voice-status" class="status-line small muted"></span>
+        </div>
+
         <div class="opt-row wall-row">
           <span>No-go walls</span>
           <button class="ctrl sm" id="btn-wall">＋ Wall</button>

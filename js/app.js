@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v44';
+const APP_VER = 'v45';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -2434,6 +2434,8 @@ function clearHistory() {
   renderHistory();
 }
 
+function setVoiceStatus(t, err){const el=$('voice-status');if(!el)return;el.textContent=t||'';el.className='status-line small '+(err?'':'muted');}
+
 function wireControls() {
   on('btn-sweep', () => sendCmd(CMD.SWEEP));
   on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
@@ -2468,6 +2470,30 @@ function wireControls() {
   if (presetBox) presetBox.querySelectorAll('.chip').forEach((c) => { c.onclick = () => { setSchedDays(+c.dataset.mask); schedMessage(''); }; });
   on('btn-logout', logout);
   on('btn-copy-log', copyDiag);
+  on('btn-voice-get', () => {
+    if (!state.mqtt.connected) { setVoiceStatus('Not connected', true); return; }
+    setVoiceStatus('Requesting voice...');
+    sendCmd(82); // GET_VOICE_ID
+    setTimeout(() => {
+      const v = state.voiceId || '';
+      $('voice-id').value = v;
+      setVoiceStatus(v ? ('Current: ' + v) : 'No response yet');
+    }, 800);
+  });
+  on('btn-voice-set', () => {
+    if (!state.mqtt.connected) { setVoiceStatus('Not connected', true); return; }
+    const v = ($('voice-id').value || '').trim();
+    if (!v) { setVoiceStatus('Enter voice_id', true); return; }
+    setVoiceStatus('Setting voice...');
+    sendCmd(79, { voice_id: v });
+    setTimeout(() => {
+      sendCmd(82);
+      setTimeout(() => {
+        const cur = state.voiceId || '';
+        setVoiceStatus(cur === v ? ('Set OK: ' + cur) : ('Sent; current: ' + cur));
+      }, 600);
+    }, 400);
+  });
   onEvent('sched-time', 'change', () => schedMessage(''));
   onEvent('sched-task', 'change', () => schedMessage(''));
   onEvent('sched-duration', 'change', () => schedMessage(''));
