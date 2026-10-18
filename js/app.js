@@ -11,14 +11,15 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v45';
+const APP_VER = 'v46';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
   ENTIRE_EXPLORE_MAP: 17, ENTIRE_SWEEP_MAP: 18, ROBOTTRACK: 19,
   SWEEP_AREA: 20, DOCK_POSE: 21, ROBOT_STATUS: 22,
   SWEEP_REGION: 28, SWEEPING_REGION: 29, SWEEP_TIME: 12,
-  SWEEP_FAN_MODE: 25, SMART_PRESSURIZATION: 58, NETWORK_INFO: 24
+  SWEEP_FAN_MODE: 25, SMART_PRESSURIZATION: 58, NETWORK_INFO: 24,
+  DEVICE_VOICE_ID: 57, SILENCE_MODE: 27
 };
 const CMD = {
   STOP: 24, GO_HOME: 25, SWEEP: 26, SWEEP_SPOT: 27, CLEAR_MAP: 54, FIND_ME: 56,
@@ -26,7 +27,9 @@ const CMD = {
   UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
   GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42,
   GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
-  UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106, SYNC_SCHEDULE_TASK: 31
+  UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106, SYNC_SCHEDULE_TASK: 31,
+  GET_VOICE_ID: 82, SET_VOICE_ID: 79,
+  GET_DO_NOT_DISTURB: 62, SET_DO_NOT_DISTURB: 63
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -161,6 +164,7 @@ const state = {
   ctrlEnabled: false,
   fanMode: null,
   carpetBoost: null,   // smart pressurization (auto boost on carpet)
+  muted: null,         // do-not-disturb / silence mode
   area: null,          // cleaned area m2
   sweepTime: null,     // seconds
   view: { scale: 0, ox: 0, oy: 0, fit: true }, // px-per-meter + origin offset (CSS px)
@@ -349,6 +353,7 @@ function sendProbes() {
   requestFanMode();
   requestSmartPress();
   requestNetworkInfo();
+  requestSilenceMode();
   requestEntireMap();
 }
 
@@ -417,6 +422,21 @@ function renderPose() {
   const live = ageS < 5 ? 'live' : (isFinite(ageS) ? 'stale ' + Math.floor(ageS) + 's' : 'stale');
   el.textContent = `x ${p.x.toFixed(2)} m  ·  y ${p.y.toFixed(2)} m  ·  yaw ${deg.toFixed(0)}°  ·  ${live}`;
   el.className = 'status-line' + (ageS < 5 ? '' : ' muted');
+}
+
+/* POSE messages arrive ~10 Hz; repainting this readout that often is wasted
+   work, so coalesce to at most ~5 Hz (200 ms floor, with a trailing repaint). */
+let _poseRenderTs = 0, _poseRenderTimer = 0;
+function renderPoseThrottled() {
+  const now = Date.now();
+  const wait = 200 - (now - _poseRenderTs);
+  if (wait <= 0) { _poseRenderTs = now; renderPose(); return; }
+  if (_poseRenderTimer) return;
+  _poseRenderTimer = setTimeout(() => {
+    _poseRenderTimer = 0;
+    _poseRenderTs = Date.now();
+    renderPose();
+  }, wait);
 }
 
 /* ================= MQTT ================= */
@@ -551,6 +571,7 @@ function setCtrlEnabled(on) {
   $('btn-stop').disabled = !on;
   $('fan-mode').disabled = !on;
   $('carpet-boost').disabled = !on;
+  const muteBtn = $('btn-mute'); if (muteBtn) muteBtn.disabled = !on;
   if (!on && state.wallMode) {
     state.wallMode = false;
     state.wallDraft = null;
@@ -588,6 +609,21 @@ function sendFanMode(value) {
 function requestSmartPress() {
   sendCmd(CMD.GET_SMART_PRESSURIZATION, { messageId: '' });
 }
+function requestSilenceMode() {
+  sendCmd(CMD.GET_DO_NOT_DISTURB);
+}
+function setMuteButton() {
+  const mb = $('btn-mute');
+  if (!mb) return;
+  mb.classList.toggle('active', !!state.muted);
+  mb.textContent = state.muted ? 'Muted' : 'Mute';
+}
+function toggleMute() {
+  const next = !state.muted;
+  state.muted = next;
+  setMuteButton();
+  sendCmd(CMD.SET_DO_NOT_DISTURB, { enabled: next });
+}
 function requestNetworkInfo() {
   sendCmd(CMD.NETWORK_INFO);
 }
@@ -615,7 +651,7 @@ function renderWifi() {
       : 'WiFi: — (robot offline)';
   }
   if (last) txt += ' · live ' + ago(last);
-  el.textContent = txt;
+  if (el.textContent !== txt) el.textContent = txt;
 }
 function ago(ts) {
   const s = Math.floor((Date.now() - ts) / 1000);
@@ -640,7 +676,7 @@ let poseTimer = null;
 function startPoseTick() {
   if (poseTimer) return;
   poseTimer = setInterval(() => {
-    renderPose();
+    renderPoseThrottled();
     // Keep the map fresh: if the robot has gone quiet (not streaming tiles) but
     // is still reachable, ask for the full map again so the pose never tracks
     // over a stale floor plan.
@@ -684,7 +720,7 @@ function handleAppMessage(topic, payload, raw) {
         log('pose sample: x=' + p.x + ' y=' + p.y + ' yaw=' + p.yaw);
       }
       trackPose(state.pose);
-      renderPose();
+      renderPoseThrottled();
       // When viewing a saved/cloud map the pose/s trail aren't drawn, so a full
       // repaint here would be wasted work.
       if (state.mapSource !== 'saved') drawMap$();
@@ -748,6 +784,14 @@ function handleAppMessage(topic, payload, raw) {
         if (cb) cb.checked = state.carpetBoost;
       }
       break;
+    case TYPE.SILENCE_MODE: {
+      const en = (p && typeof p === 'object')
+        ? (p.enabled !== undefined ? p.enabled : p.value)
+        : p;
+      state.muted = !!en;
+      setMuteButton();
+      break;
+    }
     case TYPE.NETWORK_INFO:
       if (p && typeof p === 'object') {
         state.wifi = {
@@ -781,6 +825,11 @@ function handleAppMessage(topic, payload, raw) {
       break;
     case TYPE.HELLO:
       if (!state._helloLogged) { state._helloLogged = true; log('robot HELLO'); }
+      break;
+    case TYPE.DEVICE_VOICE_ID:
+      state.voiceId = (p && typeof p === 'object')
+        ? String(p.voice_id != null ? p.voice_id : (p.id != null ? p.id : ''))
+        : (p == null ? '' : String(p));
       break;
     case TYPE.SWEEP_REGION:
     case TYPE.SWEEPING_REGION:
@@ -1122,7 +1171,8 @@ function renderMap() {
   // The static layer (floor plan + walls + no-go zones) only changes when the
   // map, view or zones change; POSE streams (~10 Hz) reuse it in one blit plus a
   // couple of cheap overlays, instead of re-rasterising every tile each frame.
-  if (_scKey !== staticLayerKey(W, H, dpr, v, b) || !_sc) buildStaticLayer(W, H, dpr, v, b);
+  const scKey = staticLayerKey(W, H, dpr, v, b);
+  if (_scKey !== scKey || !_sc) buildStaticLayer(W, H, dpr, v, b, scKey);
   ctx.drawImage(_sc, 0, 0, W, H);
 
   if (state.mapSource === 'saved') {
@@ -1258,7 +1308,7 @@ function staticLayerKey(W, H, dpr, v, b) {
     b.minX, b.minY, b.maxX, b.maxY,
     state.mapSource, state._mapVer || 0, state._wallVer || 0, state._nogoVer || 0].join('|');
 }
-function buildStaticLayer(W, H, dpr, v, b) {
+function buildStaticLayer(W, H, dpr, v, b, key) {
   if (!_sc) { _sc = document.createElement('canvas'); _scx = _sc.getContext('2d'); }
   _sc.width = Math.max(1, Math.round(W * dpr));
   _sc.height = Math.max(1, Math.round(H * dpr));
@@ -1288,7 +1338,7 @@ function buildStaticLayer(W, H, dpr, v, b) {
     drawWalls(c, v, b, null);
     drawNoGo(c, v, b, null);
   }
-  _scKey = staticLayerKey(W, H, dpr, v, b);
+  _scKey = key !== undefined ? key : staticLayerKey(W, H, dpr, v, b);
   return _sc;
 }
 
@@ -2473,7 +2523,7 @@ function wireControls() {
   on('btn-voice-get', () => {
     if (!state.mqtt.connected) { setVoiceStatus('Not connected', true); return; }
     setVoiceStatus('Requesting voice...');
-    sendCmd(82); // GET_VOICE_ID
+    sendCmd(CMD.GET_VOICE_ID);
     setTimeout(() => {
       const v = state.voiceId || '';
       $('voice-id').value = v;
@@ -2485,9 +2535,9 @@ function wireControls() {
     const v = ($('voice-id').value || '').trim();
     if (!v) { setVoiceStatus('Enter voice_id', true); return; }
     setVoiceStatus('Setting voice...');
-    sendCmd(79, { voice_id: v });
+    sendCmd(CMD.SET_VOICE_ID, { voice_id: v });
     setTimeout(() => {
-      sendCmd(82);
+      sendCmd(CMD.GET_VOICE_ID);
       setTimeout(() => {
         const cur = state.voiceId || '';
         setVoiceStatus(cur === v ? ('Set OK: ' + cur) : ('Sent; current: ' + cur));
@@ -2498,6 +2548,10 @@ function wireControls() {
   onEvent('sched-task', 'change', () => schedMessage(''));
   onEvent('sched-duration', 'change', () => schedMessage(''));
   onEvent('carpet-boost', 'change', (e) => toggleCarpetBoost(!!e.target.checked));
+  on('btn-mute', () => {
+    if (!state.mqtt.connected) { ctrlMsg('Not connected', true); return; }
+    toggleMute();
+  });
   on('btn-check-now', async () => {
     const btn = $('btn-check-now');
     const b = $('banner');
@@ -2555,6 +2609,7 @@ function show(id) {
 
 function clearState() {
   if (state.run) finalizeRun();
+  state.run = null;
   state.history = [];
   state.cloudHistory = [];
   state.robotTz = null;
@@ -2589,6 +2644,8 @@ function clearState() {
   state.carpetBoost = null;
   const cbEl = $('carpet-boost');
   if (cbEl) cbEl.checked = false;
+  state.muted = null;
+  setMuteButton();
   state.wifi = null;
   state.wifiTs = 0;
   state.lastContact = 0;

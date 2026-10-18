@@ -93,13 +93,13 @@
     return out;
   }
 
-  function parsePublish(bytes, headerStart, body) {
+  function parsePublish(body, qos) {
     // returns { topic, payload (Uint8Array) }
-    const tl = (body[headerStart] << 8) | body[headerStart + 1];
-    let at = headerStart + 2;
+    const tl = (body[0] << 8) | body[1];
+    let at = 2;
     let topic = '';
     for (let i = 0; i < tl; i++) topic += String.fromCharCode(body[at++]);
-    // skip packet id (QoS>0) - robot uses QoS 0
+    if (qos > 0) at += 2; // 2-byte packet identifier is present for QoS 1/2
     const payload = body.slice(at);
     return { topic, payload };
   }
@@ -109,6 +109,7 @@
       this.ws = null;
       this.connected = false;
       this.msgId = 1;
+      this._subCbs = Object.create(null); // SUBACK callbacks keyed by message id
       this._buffer = null; // accumulating incoming bytes
       this.onConnect = null;
       this.onMessage = null;
@@ -161,13 +162,13 @@
         const bodyAt = rl.next;
         if (buf.length < bodyAt + rl.value) break; // incomplete frame
         const body = buf.subarray(bodyAt, bodyAt + rl.value);
-        this._handle(type, body);
+        this._handle(type, body, (first >> 1) & 0x03);
         at = bodyAt + rl.value;
       }
       this._buffer = at < buf.length ? buf.subarray(at) : null;
     }
 
-    _handle(type, body) {
+    _handle(type, body, qos) {
       switch (type) {
         case 2: // CONNACK: body = [sessionPresent, returnCode]
           if (this._connAckCb) {
@@ -176,13 +177,16 @@
           }
           break;
         case 3: { // PUBLISH
-          const msg = parsePublish(body, 0, body);
+          const msg = parsePublish(body, qos);
           if (this.onMessage) this.onMessage(msg.topic, msg.payload, body);
           break;
         }
-        case 9: // SUBACK
-          if (this._subAckCb) this._subAckCb(Array.from(body.slice(2)));
+        case 9: { // SUBACK: body = [msgId hi, msgId lo, granted...]
+          const mid = (body[0] << 8) | body[1];
+          const cb = this._subCbs[mid];
+          if (cb) { delete this._subCbs[mid]; cb(Array.from(body.slice(2))); }
           break;
+        }
         case 13: // PINGRESP
           break;
         default:
@@ -197,9 +201,9 @@
     }
 
     subscribe(topic, qos, cb) {
-      this._subAckCb = cb || null;
       const id = this.msgId;
       this.msgId = (id >= 0xfffe) ? 1 : id + 1;
+      if (cb) this._subCbs[id] = cb;
       this._send(buildSubscribe(id, topic, qos || 0));
     }
 

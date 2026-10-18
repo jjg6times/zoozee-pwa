@@ -1,4 +1,4 @@
-const CACHE = 'jarvis-remote-v45';
+const CACHE = 'jarvis-remote-v46';
 const ASSETS = [
   './',
   './index.html',
@@ -53,6 +53,12 @@ self.addEventListener('fetch', (e) => {
         }
         return res;
       })
-      .catch(() => caches.match(e.request).then((hit) => hit || caches.match('./index.html')))
+      .catch(() => caches.match(e.request).then((hit) => {
+        if (hit) return hit;
+        // Only fall back to the app shell for page navigations; returning HTML
+        // for a missing script/style/image would just be a parse error.
+        if (e.request.mode === 'navigate') return caches.match('./index.html');
+        return Response.error();
+      }))
   );
 });
