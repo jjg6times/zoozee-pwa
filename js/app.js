@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v46';
+const APP_VER = 'v47';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -150,6 +150,7 @@ const state = {
   walls: [],           // [{id,x0,y0,x1,y1}] in meters (virtual walls)
   wallMode: false,
   wallDirty: false,
+  wallDrag: null,      // {wall, ox0, oy0, ox1, oy1, moved:false} for dragging existing walls
   _wallVer: 0,         // bumped on wall changes (invalidates the static map layer)
   noGo: [],            // [{id,x0,y0,x1,y1}] no-go (forbidden) rectangles in meters
   noGoMode: false,
@@ -348,6 +349,10 @@ function waitReach(ms) {
   });
 }
 
+function requestSweepRegions() {
+  if (CMD.GET_SWEEP_REGION !== undefined) sendCmd(CMD.GET_SWEEP_REGION);
+}
+
 function sendProbes() {
   if (!state.mqtt.connected) return;
   requestFanMode();
@@ -355,6 +360,7 @@ function sendProbes() {
   requestNetworkInfo();
   requestSilenceMode();
   requestEntireMap();
+  requestSweepRegions();
 }
 
 function handleReach() {
@@ -566,7 +572,7 @@ async function pollDeviceStatus() {
 }
 
 function setCtrlEnabled(on) {
-  const ids = ['btn-sweep', 'btn-edge', 'btn-spot', 'btn-home', 'btn-find', 'btn-wall', 'btn-wall-save', 'btn-nogo', 'btn-remap', 'btn-all-clear'];
+  const ids = ['btn-sweep', 'btn-edge', 'btn-spot', 'btn-home', 'btn-find', 'btn-wall', 'btn-wall-refresh', 'btn-wall-save', 'btn-nogo', 'btn-remap', 'btn-all-clear'];
   ids.forEach(id => { const el = $(id); if (el) el.disabled = !on; });
   $('btn-stop').disabled = !on;
   $('fan-mode').disabled = !on;
@@ -833,6 +839,29 @@ function handleAppMessage(topic, payload, raw) {
       break;
     case TYPE.SWEEP_REGION:
     case TYPE.SWEEPING_REGION:
+      // Some firmwares report virtual walls as sweep regions; try to extract if present
+      try {
+        if (Array.isArray(p) && !state.wallDirty) {
+          const walls = [];
+          p.forEach((r, idx) => {
+            if (r && Array.isArray(r.points) && r.points.length >= 2) {
+              const pts = r.points;
+              for (let i = 0; i < pts.length - 1; i++) {
+                const a = pts[i], b = pts[i + 1];
+                if (a && b && typeof a.x === 'number' && typeof b.x === 'number') {
+                  walls.push({ id: walls.length, x0: a.x, y0: a.y, x1: b.x, y1: b.y });
+                }
+              }
+            }
+          });
+          if (walls.length) {
+            state.walls = walls;
+            state._wallVer++;
+            setWallBank();
+            drawMap$();
+          }
+        }
+      } catch (e) {}
       break;
     default:
       log('rx f=' + f + ' ' + bytesToStr(payload).slice(0, 160));
@@ -1348,7 +1377,7 @@ function drawAll() { drawMap$(); }
 function setWallBank() {
   const el = $('wall-status');
   if (!el) return;
-  el.textContent = (state.wallDirty ? '● unsaved · ' : '') + state.walls.length + ' wall' + (state.walls.length === 1 ? '' : 's') + (state.wallMode ? ' — drag to add, tap a wall to delete' : '');
+  el.textContent = (state.wallDirty ? '● unsaved · ' : '') + state.walls.length + ' wall' + (state.walls.length === 1 ? '' : 's') + (state.wallMode ? ' — drag empty space to add, drag a wall to move, tap a wall to delete' : '');
   const save = $('btn-wall-save');
   const clear = $('btn-wall-clear');
   if (save) save.disabled = !state.wallDirty;
@@ -1360,9 +1389,9 @@ function toggleWallMode() {
   state.wallMode = !state.wallMode;
   if (state.wallMode) { state.spot = false; $('btn-spot').textContent = 'Spot region'; state.spotCur = null; }
   const btn = $('btn-wall');
-  btn.textContent = state.wallMode ? 'Cancel' : '＋ Wall';
-  btn.classList.toggle('active', state.wallMode);
+  if (btn) { btn.textContent = state.wallMode ? 'Cancel' : '＋ Wall'; btn.classList.toggle('active', state.wallMode); }
   state.wallDraft = null;
+  state.wallDrag = null;
   setWallBank();
   drawMap$();
 }
@@ -1525,9 +1554,18 @@ function setupMap() {
     if (ptrs.size === 1) {
       down = { x: p.x, y: p.y, moved: false };
       if (state.spot) state.spotCur = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
-      if (state.wallMode) {
-        const w = screenToWorld(p.x, p.y);
-        if (w) state.wallDraft = { draft: true, x0: w.x, y0: w.y, x1: w.x, y1: w.y };
+      if (state.wallMode && state.worldBounds) {
+        const hit = nearestWall(p);
+        if (hit) {
+          state.wallDrag = { wall: hit, ox0: hit.x0, oy0: hit.y0, ox1: hit.x1, oy1: hit.y1, moved: false };
+          state.wallDraft = null;
+        } else {
+          const w = screenToWorld(p.x, p.y);
+          if (w) state.wallDraft = { draft: true, x0: w.x, y0: w.y, x1: w.x, y1: w.y };
+          state.wallDrag = null;
+        }
+      } else {
+        state.wallDrag = null;
       }
       if (state.noGoMode) {
         const w = screenToWorld(p.x, p.y);
@@ -1538,6 +1576,8 @@ function setupMap() {
       const [a, b] = [...ptrs.values()];
       pinchD = Math.hypot(a.x - b.x, a.y - b.y) || 1;
       down = null;
+      state.wallDrag = null;
+      state.wallDraft = null;
     }
   });
 
@@ -1559,9 +1599,28 @@ function setupMap() {
     if (state.spot) {
       state.spotCur = { x0: down.x, y0: down.y, x1: p.x, y1: p.y };
       drawMap$();
-    } else if (state.wallMode) {
+    } else if (state.wallMode && state.wallDrag) {
+      if (down.moved) {
+        state.wallDrag.moved = true;
+        const w = screenToWorld(p.x, p.y);
+        const w0 = screenToWorld(down.x, down.y);
+        if (w && w0) {
+          const ddx = w.x - w0.x;
+          const ddy = w.y - w0.y;
+          const wall = state.wallDrag.wall;
+          wall.x0 = state.wallDrag.ox0 + ddx;
+          wall.y0 = state.wallDrag.oy0 + ddy;
+          wall.x1 = state.wallDrag.ox1 + ddx;
+          wall.y1 = state.wallDrag.oy1 + ddy;
+          state.wallDirty = true;
+          state._wallVer++;
+          setWallBank();
+          drawMap$();
+        }
+      }
+    } else if (state.wallMode && state.wallDraft) {
       const w = screenToWorld(p.x, p.y);
-      if (w && state.wallDraft) { state.wallDraft.x1 = w.x; state.wallDraft.y1 = w.y; }
+      if (w) { state.wallDraft.x1 = w.x; state.wallDraft.y1 = w.y; }
       drawMap$();
     } else if (state.noGoMode) {
       const w = screenToWorld(p.x, p.y);
@@ -1581,6 +1640,27 @@ function setupMap() {
     if (ptrs.size > 0) return;
     pinchD = null;
     if (!down) { drawMap$(); return; }
+    if (state.wallMode && state.wallDrag) {
+      if (state.wallDrag.moved) {
+        state.wallDirty = true;
+        setWallBank();
+        ctrlMsg('wall moved — tap Save to send', false);
+      } else if (!down.moved) {
+        // tap on existing wall - delete it
+        const hit = state.wallDrag.wall;
+        state.walls = state.walls.filter(w => w.id !== hit.id);
+        state.wallDirty = true;
+        state._wallVer++;
+        setWallBank();
+        ctrlMsg('wall removed — tap Save to send', false);
+        drawMap$();
+      }
+      state.wallDrag = null;
+      down = null;
+      state.wallDraft = null;
+      state.noGoDraft = null;
+      return;
+    }
     if (!down.moved) {
       // tap
       if (state.wallMode && state.worldBounds) {
@@ -1606,7 +1686,7 @@ function setupMap() {
           drawMap$();
         }
       }
-    } else if (state.wallMode) {
+    } else if (state.wallMode && state.wallDraft) {
       finishWallDraft();
     } else if (state.noGoMode) {
       finishNoGoDraft();
@@ -1616,6 +1696,7 @@ function setupMap() {
     down = null;
     state.wallDraft = null;
     state.noGoDraft = null;
+    state.wallDrag = null;
   };
   canvas.addEventListener('pointerup', finishPointer);
   canvas.addEventListener('pointercancel', finishPointer);
@@ -1904,13 +1985,11 @@ function startDateFor(t, mask) {
     // one-shot → the next occurrence of this clock time
     if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
   } else {
-    // repeating → the first selected weekday at/after now (keeps the stored
-    // start_date consistent with the "next run" shown in the UI)
-    const days = daysFromMask(mask);
-    let guard = 0;
-    while ((d.getTime() <= Date.now() || days.indexOf(d.getDay()) === -1) && guard++ < 8) {
-      d.setDate(d.getDate() + 1);
-    }
+    // For recurring schedules, some firmwares expect the start_date to anchor
+    // to the configured time (often "today" at that time) rather than jumping
+    // to the next matching weekday. Keep it simple and let repeat mask decide.
+    // If the time has already passed today, move to tomorrow as a safe anchor.
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
   }
   const pad = (n) => String(n).padStart(2, '0');
   const off = -d.getTimezoneOffset();
@@ -2500,6 +2579,13 @@ function wireControls() {
     }
   });
   on('btn-wall', toggleWallMode);
+  on('btn-wall-refresh', () => {
+    if (!state.mqtt.connected) { ctrlMsg('Not connected', true); return; }
+    state.wallDirty = false;
+    setWallBank();
+    requestSweepRegions();
+    ctrlMsg('Requested walls/regions from robot', false);
+  });
   on('btn-wall-save', saveWalls);
   on('btn-wall-clear', clearWalls);
   on('btn-nogo', toggleNoGoMode);
@@ -2657,6 +2743,8 @@ function clearState() {
   state.walls = [];
   state.wallDirty = false;
   state.wallMode = false;
+  state.wallDraft = null;
+  state.wallDrag = null;
   state.noGo = [];
   state.noGoDirty = false;
   state.noGoMode = false;
