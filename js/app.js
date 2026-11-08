@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v47';
+const APP_VER = 'v48';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -24,7 +24,7 @@ const TYPE = {
 const CMD = {
   STOP: 24, GO_HOME: 25, SWEEP: 26, SWEEP_SPOT: 27, CLEAR_MAP: 54, FIND_ME: 56,
   START_SWEEP_REGION: 68, START_AUTO_EXPLORING: 108, START_EDGE_SWEEPING: 109,
-  UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
+  GET_VIRTUAL_WALL: 28, UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
   GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42,
   GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
   UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106, SYNC_SCHEDULE_TASK: 31,
@@ -150,7 +150,8 @@ const state = {
   walls: [],           // [{id,x0,y0,x1,y1}] in meters (virtual walls)
   wallMode: false,
   wallDirty: false,
-  wallDrag: null,      // {wall, ox0, oy0, ox1, oy1, moved:false} for dragging existing walls
+  wallSelId: null,     // id of the wall currently selected for editing
+  wallDrag: null,      // {wall, mode:'body'|'start'|'end', ox0,oy0,ox1,oy1, moved:false}
   _wallVer: 0,         // bumped on wall changes (invalidates the static map layer)
   noGo: [],            // [{id,x0,y0,x1,y1}] no-go (forbidden) rectangles in meters
   noGoMode: false,
@@ -353,6 +354,10 @@ function requestSweepRegions() {
   if (CMD.GET_SWEEP_REGION !== undefined) sendCmd(CMD.GET_SWEEP_REGION);
 }
 
+function requestVirtualWalls() {
+  if (CMD.GET_VIRTUAL_WALL !== undefined) sendCmd(CMD.GET_VIRTUAL_WALL);
+}
+
 function sendProbes() {
   if (!state.mqtt.connected) return;
   requestFanMode();
@@ -361,6 +366,7 @@ function sendProbes() {
   requestSilenceMode();
   requestEntireMap();
   requestSweepRegions();
+  requestVirtualWalls();
 }
 
 function handleReach() {
@@ -756,12 +762,7 @@ function handleAppMessage(topic, payload, raw) {
       renderStatus();
       break;
     case TYPE.VIRTUAL_WALLS:
-      if (!state.wallDirty) {
-        state.walls = parseWalls(p);
-        state._wallVer++;
-        setWallBank();
-        drawMap$();
-      }
+      applyWallsFromPayload(p, 'walls');
       break;
     case TYPE.DOCK_POSE:
       if (p && typeof p === 'object') {
@@ -839,49 +840,113 @@ function handleAppMessage(topic, payload, raw) {
       break;
     case TYPE.SWEEP_REGION:
     case TYPE.SWEEPING_REGION:
-      // Some firmwares report virtual walls as sweep regions; try to extract if present
-      try {
-        if (Array.isArray(p) && !state.wallDirty) {
-          const walls = [];
-          p.forEach((r, idx) => {
-            if (r && Array.isArray(r.points) && r.points.length >= 2) {
-              const pts = r.points;
-              for (let i = 0; i < pts.length - 1; i++) {
-                const a = pts[i], b = pts[i + 1];
-                if (a && b && typeof a.x === 'number' && typeof b.x === 'number') {
-                  walls.push({ id: walls.length, x0: a.x, y0: a.y, x1: b.x, y1: b.y });
-                }
-              }
-            }
-          });
-          if (walls.length) {
-            state.walls = walls;
-            state._wallVer++;
-            setWallBank();
-            drawMap$();
-          }
-        }
-      } catch (e) {}
+      // Some firmwares report virtual walls as sweep regions (polygon points).
+      applyWallsFromPayload(p, 'regions');
       break;
     default:
       log('rx f=' + f + ' ' + bytesToStr(payload).slice(0, 160));
   }
 }
 
+/* Virtual-wall payloads differ between firmwares. Accept every shape we've
+   seen or that a firmware could plausibly emit, and normalise to segments:
+     [[x0,y0],[x1,y1], ...]      nested point pairs (original format)
+     [[x0,y0,x1,y1], ...]        flat 4-number lines
+     [{x0,y0,x1,y1}, ...]        named objects
+     [{points:[{x,y},...]}, ...] sweep-region style polygons
+     {start:[x,y], end:[x,y]}    named endpoints
+     {walls:[...]}, {virtual_walls:[...]}  wrapped lists                 */
 function parseWalls(p) {
   const out = [];
-  if (!Array.isArray(p)) return out;
-  p.forEach((line, idx) => {
-    if (!Array.isArray(line) || line.length !== 2) return;
-    const s = line[0], e = line[1];
-    if (!Array.isArray(s) || !Array.isArray(e)) return;
-    out.push({ id: idx, x0: num(s[0]), y0: num(s[1]), x1: num(e[0]), y1: num(e[1]) });
-  });
+  if (!p) return out;
+  let list = p;
+  if (!Array.isArray(list)) {
+    if (typeof list === 'object') {
+      const wrapped = list.walls || list.virtual_walls || list.virtualWalls || list.lines || list.data;
+      if (Array.isArray(wrapped)) list = wrapped;
+      else list = [list];
+    } else {
+      return out;
+    }
+  }
+  const push = (x0, y0, x1, y1) => {
+    const a = num(x0), b = num(y0), c = num(x1), d = num(y1);
+    if (![a, b, c, d].every(isFinite)) return;
+    if (Math.hypot(c - a, d - b) < 1e-6) return;
+    out.push({ id: out.length, x0: a, y0: b, x1: c, y1: d });
+  };
+  const point = (q) => Array.isArray(q) ? [q[0], q[1]] : (q && typeof q === 'object' ? [q.x, q.y] : null);
+  const isPoint = (q) => {
+    const a = point(q);
+    return !!a && isFinite(num(a[0])) && isFinite(num(a[1]));
+  };
+  // A single wall can arrive bare as [[x0,y0],[x1,y1]] instead of a list of walls.
+  if (list.length === 2 && isPoint(list[0]) && isPoint(list[1])) list = [list];
+  const pushPoints = (pts) => {
+    // A wall is a 2-point line. Longer arrays are sweep-region polygons and must
+    // not be turned into a ring of walls.
+    if (!Array.isArray(pts) || pts.length !== 2) return;
+    const a = point(pts[0]), b = point(pts[1]);
+    if (a && b) push(a[0], a[1], b[0], b[1]);
+  };
+
+  for (const line of list) {
+    if (line == null) continue;
+    if (Array.isArray(line)) {
+      if (line.length >= 4 && line.slice(0, 4).every((n) => typeof n === 'number' || typeof n === 'string')) {
+        push(line[0], line[1], line[2], line[3]);
+      } else if (line.length === 2) {
+        const a = point(line[0]), b = point(line[1]);
+        if (a && b) push(a[0], a[1], b[0], b[1]);
+      } else {
+        pushPoints(line);
+      }
+      continue;
+    }
+    if (typeof line === 'object') {
+      if (Array.isArray(line.points)) { pushPoints(line.points); continue; }
+      if (line.start !== undefined && line.end !== undefined) {
+        const a = point(line.start), b = point(line.end);
+        if (a && b) push(a[0], a[1], b[0], b[1]);
+        continue;
+      }
+      const hasXY = ['x0', 'y0', 'x1', 'y1'].every((k) => line[k] !== undefined);
+      if (hasXY) { push(line.x0, line.y0, line.x1, line.y1); continue; }
+      const hasSE = ['start_x', 'start_y', 'end_x', 'end_y'].every((k) => line[k] !== undefined);
+      if (hasSE) push(line.start_x, line.start_y, line.end_x, line.end_y);
+    }
+  }
   return out;
 }
 
 function wallsPayload() {
   return state.walls.map(w => [[w.x0, w.y0], [w.x1, w.y1]]);
+}
+
+/* Apply an inbound wall-ish payload. Keeps unsaved user edits intact, tolerates
+   repeated identical broadcasts, and leaves a raw sample in the debug log the
+   first time a new shape arrives so unsupported formats are visible. */
+function applyWallsFromPayload(p, source) {
+  if (state.wallDirty) return;
+  let parsed;
+  try { parsed = parseWalls(p); } catch (e) { parsed = []; }
+  if (source === 'regions' && !parsed.length) return; // ordinary region list, not walls
+  const raw = JSON.stringify(p);
+  if (raw !== state._lastWallRaw) {
+    state._lastWallRaw = raw;
+    log(source + ' rx: ' + String(raw).slice(0, 200));
+  }
+  const changed = parsed.length !== state.walls.length ||
+    parsed.some((w, i) => {
+      const o = state.walls[i];
+      return !o || Math.abs(o.x0 - w.x0) > 1e-4 || Math.abs(o.y0 - w.y0) > 1e-4 ||
+        Math.abs(o.x1 - w.x1) > 1e-4 || Math.abs(o.y1 - w.y1) > 1e-4;
+    });
+  if (!changed) return;
+  state.walls = parsed;
+  state._wallVer++;
+  setWallBank();
+  drawMap$();
 }
 
 function safeJson(s) {
@@ -1262,6 +1327,7 @@ function renderMap() {
   if (state.mapSource !== 'saved') {
     drawWalls(ctx, v, b, state.wallDraft && state.wallDraft.x1 !== undefined ? state.wallDraft : null, true);
     drawNoGo(ctx, v, b, state.noGoDraft && state.noGoDraft.x1 !== undefined ? state.noGoDraft : null, true);
+    if (state.wallMode) drawWallOverlay(ctx, v, b);
   }
 
   // spot region selection
@@ -1302,6 +1368,26 @@ function drawWalls(ctx, v, b, draft, only) {
     }
     ctx.fillStyle = '#ff8fa3';
     for (const pt of [s, e]) { ctx.beginPath(); ctx.arc(pt.x, pt.y, Math.max(3, 0.03 * v.scale), 0, Math.PI * 2); ctx.fill(); }
+  }
+}
+
+function drawWallOverlay(ctx, v, b) {
+  for (const w of state.walls) {
+    const s = { x: v.ox + (w.x0 - b.minX) * v.scale, y: v.oy + (w.y0 - b.minY) * v.scale };
+    const e = { x: v.ox + (w.x1 - b.minX) * v.scale, y: v.oy + (w.y1 - b.minY) * v.scale };
+    if (state.wallSelId === w.id) {
+      ctx.strokeStyle = 'rgba(255,255,255,.85)';
+      ctx.lineWidth = Math.max(4, 0.06 * v.scale);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(e.x, e.y); ctx.stroke();
+    }
+    const r = 7;
+    ctx.fillStyle = state.wallSelId === w.id ? '#ffffff' : 'rgba(255,143,163,.92)';
+    ctx.strokeStyle = '#0a0f1c';
+    ctx.lineWidth = 1.5;
+    for (const pt of [s, e]) {
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
   }
 }
 
@@ -1377,7 +1463,7 @@ function drawAll() { drawMap$(); }
 function setWallBank() {
   const el = $('wall-status');
   if (!el) return;
-  el.textContent = (state.wallDirty ? '● unsaved · ' : '') + state.walls.length + ' wall' + (state.walls.length === 1 ? '' : 's') + (state.wallMode ? ' — drag empty space to add, drag a wall to move, tap a wall to delete' : '');
+  el.textContent = (state.wallDirty ? '● unsaved · ' : '') + state.walls.length + ' wall' + (state.walls.length === 1 ? '' : 's') + (state.wallMode ? ' — tap map to place, drag body to move, drag ends to resize, tap again to delete' : '');
   const save = $('btn-wall-save');
   const clear = $('btn-wall-clear');
   if (save) save.disabled = !state.wallDirty;
@@ -1392,7 +1478,32 @@ function toggleWallMode() {
   if (btn) { btn.textContent = state.wallMode ? 'Cancel' : '＋ Wall'; btn.classList.toggle('active', state.wallMode); }
   state.wallDraft = null;
   state.wallDrag = null;
+  state.wallSelId = null;
   setWallBank();
+  drawMap$();
+}
+
+function placeWallAt(w) {
+  if (!w) return;
+  const half = 0.6; // 1.2 m default wall, centred on the tap
+  const id = state.walls.reduce((m, x) => Math.max(m, x.id), -1) + 1;
+  state.walls.push({ id, x0: w.x - half, y0: w.y, x1: w.x + half, y1: w.y });
+  state.wallDirty = true;
+  state._wallVer++;
+  state.wallSelId = id;
+  ctrlMsg('wall placed — drag it to move, drag the ends to resize, tap again to delete', false);
+  setWallBank();
+  drawMap$();
+}
+
+function removeWall(w) {
+  if (!w) return;
+  state.walls = state.walls.filter(x => x.id !== w.id);
+  if (state.wallSelId === w.id) state.wallSelId = null;
+  state.wallDirty = true;
+  state._wallVer++;
+  setWallBank();
+  ctrlMsg('wall removed — tap Save to send', false);
   drawMap$();
 }
 
@@ -1422,6 +1533,7 @@ function saveWalls() {
 function clearWalls() {
   state.walls = [];
   state.wallDirty = true;
+  state.wallSelId = null;
   state._wallVer++;
   setWallBank();
   drawMap$();
@@ -1537,12 +1649,26 @@ function setupMap() {
 
   const pos = (e) => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
   const nearestWall = (p) => {
-    let best = null, bestD = 10;
+    // Touch-friendly hit radius: walls are thin, so allow ~22 px around the body.
+    let best = null, bestD = 22;
     for (const w of state.walls) {
       const s = worldToScreen(w.x0, w.y0);
       const e = worldToScreen(w.x1, w.y1);
       const d = distToSegment(p, s, e);
       if (d < bestD) { bestD = d; best = w; }
+    }
+    return best;
+  };
+  // Which end (if any) of an existing wall is under the pointer?
+  const nearestWallEnd = (p) => {
+    let best = null, bestD = 26;
+    for (const w of state.walls) {
+      const s = worldToScreen(w.x0, w.y0);
+      const e = worldToScreen(w.x1, w.y1);
+      const d0 = Math.hypot(p.x - s.x, p.y - s.y);
+      const d1 = Math.hypot(p.x - e.x, p.y - e.y);
+      if (d0 < bestD) { bestD = d0; best = { wall: w, mode: 'start' }; }
+      if (d1 < bestD) { bestD = d1; best = { wall: w, mode: 'end' }; }
     }
     return best;
   };
@@ -1555,14 +1681,21 @@ function setupMap() {
       down = { x: p.x, y: p.y, moved: false };
       if (state.spot) state.spotCur = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
       if (state.wallMode && state.worldBounds) {
-        const hit = nearestWall(p);
+        const end = nearestWallEnd(p);
+        const hit = end ? end.wall : nearestWall(p);
         if (hit) {
-          state.wallDrag = { wall: hit, ox0: hit.x0, oy0: hit.y0, ox1: hit.x1, oy1: hit.y1, moved: false };
+          state.wallDrag = {
+            wall: hit, mode: end ? end.mode : 'body',
+            ox0: hit.x0, oy0: hit.y0, ox1: hit.x1, oy1: hit.y1, moved: false
+          };
+          // Do NOT select here: pointerup needs to know whether this wall was
+          // already selected before the tap so the first tap only selects.
           state.wallDraft = null;
         } else {
           const w = screenToWorld(p.x, p.y);
           if (w) state.wallDraft = { draft: true, x0: w.x, y0: w.y, x1: w.x, y1: w.y };
           state.wallDrag = null;
+          state.wallSelId = null;
         }
       } else {
         state.wallDrag = null;
@@ -1603,15 +1736,23 @@ function setupMap() {
       if (down.moved) {
         state.wallDrag.moved = true;
         const w = screenToWorld(p.x, p.y);
-        const w0 = screenToWorld(down.x, down.y);
-        if (w && w0) {
-          const ddx = w.x - w0.x;
-          const ddy = w.y - w0.y;
-          const wall = state.wallDrag.wall;
-          wall.x0 = state.wallDrag.ox0 + ddx;
-          wall.y0 = state.wallDrag.oy0 + ddy;
-          wall.x1 = state.wallDrag.ox1 + ddx;
-          wall.y1 = state.wallDrag.oy1 + ddy;
+        const wall = state.wallDrag.wall;
+        if (w) {
+          if (state.wallDrag.mode === 'start') {
+            wall.x0 = w.x; wall.y0 = w.y;
+          } else if (state.wallDrag.mode === 'end') {
+            wall.x1 = w.x; wall.y1 = w.y;
+          } else {
+            const w0 = screenToWorld(down.x, down.y);
+            if (w0) {
+              const ddx = w.x - w0.x;
+              const ddy = w.y - w0.y;
+              wall.x0 = state.wallDrag.ox0 + ddx;
+              wall.y0 = state.wallDrag.oy0 + ddy;
+              wall.x1 = state.wallDrag.ox1 + ddx;
+              wall.y1 = state.wallDrag.oy1 + ddy;
+            }
+          }
           state.wallDirty = true;
           state._wallVer++;
           setWallBank();
@@ -1641,19 +1782,24 @@ function setupMap() {
     pinchD = null;
     if (!down) { drawMap$(); return; }
     if (state.wallMode && state.wallDrag) {
+      const hit = state.wallDrag.wall;
       if (state.wallDrag.moved) {
         state.wallDirty = true;
+        state.wallSelId = hit.id;
         setWallBank();
-        ctrlMsg('wall moved — tap Save to send', false);
+        ctrlMsg(state.wallDrag.mode === 'body'
+          ? 'wall moved — tap Save to send'
+          : 'wall resized — tap Save to send', false);
       } else if (!down.moved) {
-        // tap on existing wall - delete it
-        const hit = state.wallDrag.wall;
-        state.walls = state.walls.filter(w => w.id !== hit.id);
-        state.wallDirty = true;
-        state._wallVer++;
-        setWallBank();
-        ctrlMsg('wall removed — tap Save to send', false);
-        drawMap$();
+        // A tap selects the wall first; tapping the already-selected wall deletes it.
+        if (state.wallSelId === hit.id) {
+          removeWall(hit);
+        } else {
+          state.wallSelId = hit.id;
+          ctrlMsg('wall selected — tap it again to delete, drag to move', false);
+          setWallBank();
+          drawMap$();
+        }
       }
       state.wallDrag = null;
       down = null;
@@ -1664,15 +1810,9 @@ function setupMap() {
     if (!down.moved) {
       // tap
       if (state.wallMode && state.worldBounds) {
-        const hit = nearestWall(p);
-        if (hit) {
-          state.walls = state.walls.filter(w => w.id !== hit.id);
-          state.wallDirty = true;
-          state._wallVer++;
-          setWallBank();
-          ctrlMsg('wall removed — tap Save to send', false);
-          drawMap$();
-        }
+        // Tap on empty map = drop a wall there (much easier than starting a drag,
+        // especially on a phone). Tap on a wall is handled above.
+        placeWallAt(screenToWorld(p.x, p.y));
       } else if (state.spot) {
         // tap with no drag = nothing to send
       } else if (state.noGoMode && state.worldBounds) {
@@ -1885,6 +2025,10 @@ async function refreshSchedules() {
     const j = JSON.parse(res.body);
     const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
     if (!items.length) { listEl.textContent = 'No scheduled tasks yet.'; return; }
+    if (!state._schedLogged || items.length !== state._schedLogged) {
+      state._schedLogged = items.length;
+      items.forEach((it) => log('schedule: ' + JSON.stringify(it).slice(0, 220)));
+    }
     listEl.className = '';
     listEl.textContent = '';
     for (const it of items) listEl.appendChild(scheduleRow(it));
@@ -1950,21 +2094,32 @@ async function addSchedule() {
   const repeat = days.reduce((n, i) => n | (1 << i), 0);
   const task = ($('sched-task') && $('sched-task').value) || 'sweep';
   const dur = parseInt(($('sched-duration') && $('sched-duration').value) || '360', 10);
-  const start_date = startDateFor(t, repeat);
   const btn = $('btn-add-sched');
   if (btn) btn.disabled = true;
   schedMessage('Adding…');
   try {
     await ensureAccess();
     await syncRobotTimezone();
+    // Compute start_date AFTER the clock/time-zone is reconciled so the first
+    // selected weekday is correct for the robot's own calendar.
+    const start_date = startDateFor(t, repeat);
+    const body = { task, start_date, enabled: true, repeat, max_duration_in_minutes: dur, version: 0 };
+    log('schedule add: ' + JSON.stringify(body));
     const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
                  'Accept': 'application/vnd.slamtec.scheduledtask-v1.0+json' },
-      body: JSON.stringify({ task, start_date, enabled: true, repeat, max_duration_in_minutes: dur, version: 0 })
+      body: JSON.stringify(body)
     });
     if (res.ok) {
-      schedMessage('Added: ' + taskLabel(task) + ' · ' + describeDays(repeat) + ' at ' + t + '.', true);
+      let msg = 'Added: ' + taskLabel(task) + ' · ' + describeDays(repeat) + ' at ' + t + '.';
+      const stored = await verifyStoredSchedule(repeat, start_date);
+      if (stored === false) {
+        msg += ' Robot stored a different repeat — day-of-week may be ignored.';
+      } else if (stored && stored.repeat !== undefined && (stored.repeat | 0) !== repeat) {
+        msg += ' Server saved repeat=' + stored.repeat + ' (sent ' + repeat + ').';
+      }
+      schedMessage(msg, stored === false);
       try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
       refreshSchedules();
     } else {
@@ -1977,6 +2132,36 @@ async function addSchedule() {
   }
 }
 
+/* Read the schedule list back and return the task that matches what we just
+   posted (same task + same clock time). Used to surface a mismatch between the
+   repeat mask we sent and the one the cloud actually stored. Returns null when
+   the list can't be read; false when the stored repeat is clearly wrong. */
+async function verifyStoredSchedule(repeat, start_date) {
+  try {
+    const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
+      headers: { 'Accept': 'application/vnd.slamtec.scheduledtasklist-v1.0+json' }
+    });
+    if (!res.ok) return null;
+    const j = JSON.parse(res.body);
+    const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
+    const want = parseStartDate(start_date);
+    const key = want ? (want.getHours() + ':' + want.getMinutes()) : '';
+    let match = null;
+    for (const it of items) {
+      const b = parseStartDate(it.start_date);
+      if (!b) continue;
+      if (b.getHours() + ':' + b.getMinutes() === key) match = it;
+    }
+    if (!match) return null;
+    log('schedule stored: ' + JSON.stringify(match).slice(0, 220));
+    if (match.repeat !== undefined && (match.repeat | 0) !== repeat) return false;
+    return match;
+  } catch (e) {
+    log('schedule verify failed: ' + e.message);
+    return null;
+  }
+}
+
 function startDateFor(t, mask) {
   const [hh, mm] = t.split(':').map(Number);
   const d = new Date();
@@ -1985,11 +2170,15 @@ function startDateFor(t, mask) {
     // one-shot → the next occurrence of this clock time
     if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
   } else {
-    // For recurring schedules, some firmwares expect the start_date to anchor
-    // to the configured time (often "today" at that time) rather than jumping
-    // to the next matching weekday. Keep it simple and let repeat mask decide.
-    // If the time has already passed today, move to tomorrow as a safe anchor.
-    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+    // Recurring → anchor start_date to the FIRST SELECTED WEEKDAY at/after now.
+    // Do NOT anchor to "today": the cloud/robot uses start_date as the first run
+    // date, and several firmwares ignore repeat for that first run. Anchoring to
+    // today made a Tue/Thu schedule run on the day the app was open.
+    const days = daysFromMask(mask);
+    let guard = 0;
+    while ((d.getTime() <= Date.now() || days.indexOf(d.getDay()) === -1) && guard++ < 14) {
+      d.setDate(d.getDate() + 1);
+    }
   }
   const pad = (n) => String(n).padStart(2, '0');
   const off = -d.getTimezoneOffset();
@@ -2582,9 +2771,11 @@ function wireControls() {
   on('btn-wall-refresh', () => {
     if (!state.mqtt.connected) { ctrlMsg('Not connected', true); return; }
     state.wallDirty = false;
+    state._lastWallRaw = null;
     setWallBank();
+    requestVirtualWalls();
     requestSweepRegions();
-    ctrlMsg('Requested walls/regions from robot', false);
+    ctrlMsg('Requested walls from robot', false);
   });
   on('btn-wall-save', saveWalls);
   on('btn-wall-clear', clearWalls);
@@ -2745,6 +2936,8 @@ function clearState() {
   state.wallMode = false;
   state.wallDraft = null;
   state.wallDrag = null;
+  state.wallSelId = null;
+  state._lastWallRaw = null;
   state.noGo = [];
   state.noGoDirty = false;
   state.noGoMode = false;
