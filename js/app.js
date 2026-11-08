@@ -869,16 +869,24 @@ function parseWalls(p) {
       return out;
     }
   }
+  const scalar = (v) => {
+    if (typeof v === 'number') return isFinite(v) ? v : null;
+    if (typeof v === 'string' && v.trim() !== '') {
+      const n = Number(v);
+      return isFinite(n) ? n : null;
+    }
+    return null;
+  };
   const push = (x0, y0, x1, y1) => {
-    const a = num(x0), b = num(y0), c = num(x1), d = num(y1);
-    if (![a, b, c, d].every(isFinite)) return;
+    const a = scalar(x0), b = scalar(y0), c = scalar(x1), d = scalar(y1);
+    if (a === null || b === null || c === null || d === null) return;
     if (Math.hypot(c - a, d - b) < 1e-6) return;
     out.push({ id: out.length, x0: a, y0: b, x1: c, y1: d });
   };
   const point = (q) => Array.isArray(q) ? [q[0], q[1]] : (q && typeof q === 'object' ? [q.x, q.y] : null);
   const isPoint = (q) => {
     const a = point(q);
-    return !!a && isFinite(num(a[0])) && isFinite(num(a[1]));
+    return !!a && scalar(a[0]) !== null && scalar(a[1]) !== null;
   };
   // A single wall can arrive bare as [[x0,y0],[x1,y1]] instead of a list of walls.
   if (list.length === 2 && isPoint(list[0]) && isPoint(list[1])) list = [list];
