@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v48';
+const APP_VER = 'v49';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -1332,11 +1332,11 @@ function renderMap() {
   }
 
   // draft walls / no-go box (committed ones are baked into the static layer)
-  if (state.mapSource !== 'saved') {
-    drawWalls(ctx, v, b, state.wallDraft && state.wallDraft.x1 !== undefined ? state.wallDraft : null, true);
-    drawNoGo(ctx, v, b, state.noGoDraft && state.noGoDraft.x1 !== undefined ? state.noGoDraft : null, true);
-    if (state.wallMode) drawWallOverlay(ctx, v, b);
-  }
+  // Draw even when viewing saved maps so edits are visible; coords may not align
+  // with a different saved map, but invisibility is worse for the user.
+  drawWalls(ctx, v, b, state.wallDraft && state.wallDraft.x1 !== undefined ? state.wallDraft : null, true);
+  drawNoGo(ctx, v, b, state.noGoDraft && state.noGoDraft.x1 !== undefined ? state.noGoDraft : null, true);
+  if (state.wallMode) drawWallOverlay(ctx, v, b);
 
   // spot region selection
   if (state.spot && state.spotCur) {
@@ -1455,12 +1455,11 @@ function buildStaticLayer(W, H, dpr, v, b, key) {
   // subtle border around the mapped area
   c.strokeStyle = 'rgba(125,146,186,.28)'; c.lineWidth = 1;
   roundRect(c, mx, my, mw, mh, 10); c.stroke();
-  // Committed walls/no-go belong to the live robot frame — never bake them over
-  // a stored/cloud map (different frame), or they'd appear in the wrong place.
-  if (state.mapSource !== 'saved') {
-    drawWalls(c, v, b, null);
-    drawNoGo(c, v, b, null);
-  }
+  // Draw committed walls/no-go so they're always visible. They may not align
+  // perfectly with a stored/cloud map from a different session, but hiding them
+  // makes the editor unusable.
+  drawWalls(c, v, b, null);
+  drawNoGo(c, v, b, null);
   _scKey = key !== undefined ? key : staticLayerKey(W, H, dpr, v, b);
   return _sc;
 }
@@ -2559,6 +2558,13 @@ async function loadCloudMap(id, name) {
    robot tiles are ignored until the user taps "Back to live". Returns the number
    of tiles actually decoded, so the caller can detect a bad payload. */
 function showMapFromPayloads(payloads, label, dock) {
+  // Fully reset map state before loading a saved/cloud map to avoid stacking
+  state.maps = [];
+  state.mapCache = new Map();
+  state.worldBounds = null;
+  state._mapVer = (state._mapVer || 0) + 1;
+  state._mapLogged = false;
+  _scKey = '';
   state.mapSource = 'saved';
   state.mapKind = null;   // force storeMapTile to reset the layer cache
   state.view.fit = true;
