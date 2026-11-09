@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v50';
+const APP_VER = 'v51';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -347,6 +347,7 @@ function armReachProbe(ms) {
     reachTimer = null;
     if (state.reachable) return;
     log('no reply in ' + Math.round(ms / 1000) + 's — robot did not answer');
+    state.reachable = false;
     setCtrlEnabled(false);
     state.ctrlEnabled = false;
     updateBadgeState(false);
@@ -383,14 +384,17 @@ function sendProbes() {
 function handleReach() {
   state.lastContact = Date.now();
   clearReachTimer();
-  if (state.reachable) return; // already online — avoid per-message DOM writes
-  log('robot is reachable (replied)');
-  state.reachable = true;
-  state.ctrlEnabled = true;
-  if (reachWaitResolve) reachWaitResolve(true);
-  setCtrlEnabled(true);
-  updateBadgeState(true);
-  renderPose();
+  if (!state.reachable) {
+    log('robot is reachable (replied)');
+    state.reachable = true;
+    if (reachWaitResolve) reachWaitResolve(true);
+    updateBadgeState(true);
+    renderPose();
+  }
+  if (state.mqtt.connected && !state.ctrlEnabled) {
+    state.ctrlEnabled = true;
+    setCtrlEnabled(true);
+  }
 }
 
 /* Coalesce status repaints to one per animation frame — POSE/ACTION messages
@@ -486,7 +490,9 @@ function connectMqtt(deviceId) {
     clearTimeout(mqttConnTimer);
     if (errCode) {
       log('MQTT CONNACK rc=' + errCode);
+      state.reachable = false;
       setCtrlEnabled(false);
+      state.ctrlEnabled = false;
       scheduleReconnect('token may be stale', true);
       return;
     }
@@ -508,8 +514,10 @@ function connectMqtt(deviceId) {
   m.onClose = (ev) => {
     state.mqttConnecting = false;
     clearTimeout(mqttConnTimer);
+    clearReachTimer();
     log('MQTT disconnected' + (ev ? ' code=' + ev.code + (ev.reason ? ' ' + ev.reason : '') : ''));
     state.mqttOk = false;
+    state.reachable = false;
     setCtrlEnabled(false);
     state.ctrlEnabled = false;
     updateBadgeState(false);
