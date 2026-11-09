@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v49';
+const APP_VER = 'v50';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -102,6 +102,16 @@ function loadLastWifi() {
 }
 function saveLastWifi(w) {
   try { localStorage.setItem('jarvis.wifi', JSON.stringify(w)); } catch (e) { /* noop */ }
+}
+function restoreDock(id) {
+  if (!id) return;
+  try {
+    const raw = localStorage.getItem('jarvis.dock:' + id);
+    if (raw) {
+      const d = JSON.parse(raw);
+      if (d && typeof d.x === 'number' && typeof d.y === 'number') state.dock = d;
+    }
+  } catch (e) {}
 }
 
 const state = {
@@ -280,6 +290,7 @@ async function fetchDevices() {
   if (picked) {
     const d = picked;
     state.deviceId = d.device_id || d.id || d.sn;
+    restoreDock(state.deviceId);
     const id = state.deviceId;
     const nOnline = devs.filter(devOnline).length;
     $('dev-name').textContent = d.name || 'Jarvis';
@@ -560,6 +571,7 @@ async function pollDeviceStatus() {
     const newId = d.device_id || d.id || d.sn;
     if (newId && newId !== curId) {
       state.deviceId = newId;
+      restoreDock(newId);
       log('switched device to ' + String(newId).slice(0, 8) + ' (previous one offline)');
     }
     if (state.device) state.device = Object.assign({}, state.device, d); else state.device = d;
@@ -767,6 +779,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.DOCK_POSE:
       if (p && typeof p === 'object') {
         state.dock = { x: num(p.x), y: num(p.y), yaw: num(p.yaw) };
+        try { if (state.deviceId) localStorage.setItem('jarvis.dock:' + state.deviceId, JSON.stringify(state.dock)); } catch (e) {}
         if (state.mapSource !== 'saved') drawMap$();
       }
       break;
@@ -1278,9 +1291,10 @@ function renderMap() {
   ctx.drawImage(_sc, 0, 0, W, H);
 
   if (state.mapSource === 'saved') {
-    // Viewing a stored/cloud map: show its own dock (if any) but NOT the live
-    // robot pose/trail, which would be misleading on a different floor plan.
-    if (state.savedDock) drawDock(ctx, v, state.savedDock);
+    // Viewing a stored/cloud map: prefer its saved dock, fall back to live dock
+    // (coords may differ from the saved map, but better than hiding home).
+    const dock = state.savedDock || state.dock;
+    if (dock) drawDock(ctx, v, dock);
   } else {
     // robot path trail (history of poses)
     const trail = state.trail;
