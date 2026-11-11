@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v51';
+const APP_VER = 'v52';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -1936,6 +1936,13 @@ function durationLabel(min) {
   const m = min || 0;
   return m >= 360 ? 'Unlimited' : (m ? m + ' min' : '—');
 }
+function maskFromDays(days) {
+  return (days || []).reduce((n, i) => n | (1 << i), 0);
+}
+function fmtMonthDay(d) {
+  const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return d ? (M[d.getMonth()] + ' ' + d.getDate()) : '—';
+}
 
 function parseStartDate(s) {
   if (!s) return null;
@@ -2044,6 +2051,7 @@ async function refreshSchedules() {
   if (!listEl || !state.device) return;
   listEl.className = 'muted';
   listEl.textContent = '…';
+  let items = [];
   try {
     await ensureAccess();
     const id = state.deviceId;
@@ -2052,22 +2060,128 @@ async function refreshSchedules() {
     });
     if (!res.ok) { listEl.textContent = 'HTTP ' + res.status; return; }
     const j = JSON.parse(res.body);
-    const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
-    if (!items.length) { listEl.textContent = 'No scheduled tasks yet.'; return; }
+    items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
     if (!state._schedLogged || items.length !== state._schedLogged) {
       state._schedLogged = items.length;
       items.forEach((it) => log('schedule: ' + JSON.stringify(it).slice(0, 220)));
     }
-    listEl.className = '';
-    listEl.textContent = '';
-    for (const it of items) listEl.appendChild(scheduleRow(it));
+    renderScheduleList(items);
   } catch (err) {
     listEl.className = 'muted';
     listEl.textContent = err.message;
+    return;
   }
+  maybeTopUp(items);
 }
 
-function scheduleRow(it) {
+/* ---- exact-run scheduling ---------------------------------------------
+   This robot's firmware fires repeat-mask (weekday) schedules one day early:
+   our Tue/Thu/Sat mask ran Mon/Wed/Fri from Oct 30 2026 on, while one-shot
+   (repeat=0) schedules start at the exact requested minute (verified live
+   2026-11-10: scheduled 02:09:00Z, robot started 02:09:04Z). So every run is
+   now created as an exact one-shot instant, grouped into one virtual row per
+   schedule, and renewed on a rolling horizon whenever the app is opened.
+   ------------------------------------------------------------------------ */
+const SCHED_HORIZON_DAYS = 28;       // keep ~4 weeks of runs queued in the cloud
+const SCHED_TOPUP_MS = 5 * 60000;    // renew at most every 5 minutes
+const SCHED_PRUNE_MS = 6 * 3600000;  // drop fired/past one-shots after 6 h
+const SCHED_LEAD_MS = 2 * 60000;     // never create a run less than 2 min out
+
+/* Split the cloud list into repeating entries (repeat != 0) and groups of
+   one-shot entries that belong to the same virtual schedule (same task,
+   clock time and duration). */
+function groupScheduleItems(items) {
+  const recurring = [];
+  const map = new Map();
+  for (const it of items) {
+    const base = parseStartDate(it.start_date);
+    if ((it.repeat || 0) !== 0 || !base) { recurring.push(it); continue; }
+    const key = (it.task || '?') + '|' + base.getHours() + ':' + base.getMinutes() + '|' +
+                (it.max_duration_in_minutes || 0);
+    let g = map.get(key);
+    if (!g) {
+      g = { task: it.task || 'sweep', hh: base.getHours(), mm: base.getMinutes(),
+            dur: it.max_duration_in_minutes || 0, entries: [] };
+      map.set(key, g);
+    }
+    g.entries.push(it);
+  }
+  const groups = [...map.values()];
+  const now = Date.now();
+  for (const g of groups) {
+    g.entries.sort((a, b) => parseStartDate(a.start_date) - parseStartDate(b.start_date));
+    const days = new Set();
+    for (const e of g.entries) {
+      const b = parseStartDate(e.start_date);
+      if (b) days.add(b.getDay());
+    }
+    g.days = [...days].sort((a, b) => a - b);
+    g.next = null;
+    g.last = null;
+    for (const e of g.entries) {
+      const b = parseStartDate(e.start_date);
+      if (!b) continue;
+      if (b.getTime() > now && (!g.next || b < g.next)) g.next = b;
+      if (!g.last || b > g.last) g.last = b;
+    }
+  }
+  return { recurring, groups };
+}
+
+function renderScheduleList(items) {
+  const listEl = $('schedule-list');
+  const { recurring, groups } = groupScheduleItems(items);
+  // Definitions whose cloud queue fully drained (app closed past the horizon)
+  // still render as rows until the renewal recreates their runs.
+  for (const def of loadSchedDefs()) {
+    const key = defKey(def.task, def.hh, def.mm, def.dur);
+    if (groups.some((g) => defKey(g.task, g.hh, g.mm, g.dur) === key)) continue;
+    groups.push({ task: def.task, hh: def.hh, mm: def.mm, dur: def.dur,
+                  days: def.days.slice().sort((a, b) => a - b), entries: [], next: null, last: null });
+  }
+  listEl.className = '';
+  listEl.textContent = '';
+  if (!recurring.length && !groups.length) {
+    listEl.className = 'muted';
+    listEl.textContent = 'No scheduled tasks yet.';
+    return;
+  }
+  for (const it of recurring) listEl.appendChild(legacyScheduleRow(it));
+  for (const g of groups) listEl.appendChild(groupScheduleRow(g));
+}
+
+/* Local schedule definitions: what the user actually asked for. The cloud
+   one-shot entries are only the robot's queue — if every queued run passes
+   while the app is closed, the definitions rebuild it on the next open. */
+function defKey(task, hh, mm, dur) {
+  return (task || '?') + '|' + hh + ':' + mm + '|' + (dur || 0);
+}
+function loadSchedDefs() {
+  try {
+    const a = JSON.parse(localStorage.getItem('jarvis.scheds') || '[]');
+    return Array.isArray(a) ? a.filter((d) => d && d.task && d.days && d.days.length) : [];
+  } catch (e) { return []; }
+}
+function saveSchedDefs(defs) {
+  try { localStorage.setItem('jarvis.scheds', JSON.stringify(defs)); } catch (e) {}
+}
+function upsertSchedDef(def) {
+  const key = defKey(def.task, def.hh, def.mm, def.dur);
+  saveSchedDefs(loadSchedDefs().filter((d) => defKey(d.task, d.hh, d.mm, d.dur) !== key).concat([def]));
+}
+function removeSchedDef(key) {
+  saveSchedDefs(loadSchedDefs().filter((d) => defKey(d.task, d.hh, d.mm, d.dur) !== key));
+}
+function schedRunsNote(r) {
+  let s = r.created + ' exact run' + (r.created === 1 ? '' : 's');
+  if (r.last) s += ' through ' + fmtMonthDay(r.last);
+  if (r.skipped) s += ' (' + r.skipped + ' already scheduled)';
+  return s;
+}
+
+/* Row for an old-style repeating (repeat-mask) schedule. This robot fires
+   those one weekday early, so the row carries a warning and a one-tap fix. */
+function legacyScheduleRow(it) {
   const row = document.createElement('div');
   row.className = 'map-item';
   const box = document.createElement('div');
@@ -2089,6 +2203,60 @@ function scheduleRow(it) {
   const bits = [describeDays(it.repeat), durationLabel(it.max_duration_in_minutes)];
   if ((it.repeat || 0) === 0) bits.push(base && next ? 'scheduled' : 'passed');
   else if (next) bits.push('next ' + fmtWhen(next));
+  if ((it.repeat || 0) !== 0) bits.push('⚠ repeating — this robot runs these a day early');
+  meta.textContent = bits.join(' · ');
+  box.appendChild(title);
+  box.appendChild(meta);
+  row.appendChild(box);
+  if ((it.repeat || 0) !== 0) {
+    const fix = document.createElement('button');
+    fix.className = 'ctrl xs';
+    fix.textContent = 'Fix';
+    fix.title = 'Convert to exact one-shot runs';
+    fix.onclick = () => convertRecurring(it);
+    row.appendChild(fix);
+  }
+  const del = document.createElement('button');
+  del.className = 'ctrl xs warn';
+  del.textContent = '✕';
+  del.title = 'Delete schedule';
+  del.onclick = () => deleteSchedule(it.scheduled_task_id);
+  row.appendChild(del);
+  return row;
+}
+
+/* Row for one virtual schedule: the group of exact one-shot runs. */
+function groupScheduleRow(g) {
+  const row = document.createElement('div');
+  row.className = 'map-item';
+  const box = document.createElement('div');
+  box.className = 'map-text';
+  const title = document.createElement('div');
+  title.className = 'map-name';
+  title.textContent = taskLabel(g.task) + ' · ' + describeDays(maskFromDays(g.days)) +
+    ' · ' + fmtClock(new Date(2000, 0, 1, g.hh, g.mm));
+  if (g.entries.some((e) => e.enabled === false)) {
+    const off = document.createElement('span');
+    off.className = 'tag-off';
+    off.textContent = 'OFF';
+    title.appendChild(document.createTextNode(' '));
+    title.appendChild(off);
+  }
+  const meta = document.createElement('div');
+  meta.className = 'status-line small muted';
+  const bits = [durationLabel(g.dur)];
+  if (g.next) bits.push('next ' + fmtWhen(g.next));
+  if (g.entries.length) {
+    bits.push(g.entries.length + ' exact run' + (g.entries.length === 1 ? '' : 's') +
+             ' through ' + fmtMonthDay(g.last));
+    const key = defKey(g.task, g.hh, g.mm, g.dur);
+    const renews = g.entries.length >= 2 ||
+                   loadSchedDefs().some((d) => defKey(d.task, d.hh, d.mm, d.dur) === key);
+    bits.push(renews ? (g.next ? 'renews in-app' : 'no upcoming run — open the app to renew')
+                     : 'one-time run');
+  } else {
+    bits.push('renewing — exact runs will be recreated');
+  }
   meta.textContent = bits.join(' · ');
   box.appendChild(title);
   box.appendChild(meta);
@@ -2096,10 +2264,62 @@ function scheduleRow(it) {
   del.className = 'ctrl xs warn';
   del.textContent = '✕';
   del.title = 'Delete schedule';
-  del.onclick = () => deleteSchedule(it.scheduled_task_id);
+  del.onclick = () => deleteScheduleGroup(g);
   row.appendChild(box);
   row.appendChild(del);
   return row;
+}
+
+async function deleteScheduleGroup(g) {
+  const n = g.entries.length;
+  if (!window.confirm('Delete this schedule (' + n + ' scheduled runs)?')) return;
+  let ok = 0;
+  try {
+    await ensureAccess();
+    for (const it of g.entries) {
+      if (!it.scheduled_task_id) continue;
+      const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks/' +
+                             encodeURIComponent(it.scheduled_task_id), { method: 'DELETE' });
+      if (res.ok) ok++;
+    }
+    schedMessage(ok === n ? 'Deleted.' : ('Deleted ' + ok + ' of ' + n + ' runs.'), ok === n);
+    // Full delete drops the stored definition too; a partial delete keeps it
+    // so the next renewal self-heals the runs that failed to delete.
+    if (ok === n) removeSchedDef(defKey(g.task, g.hh, g.mm, g.dur));
+  } catch (e) {
+    schedMessage(e.message, false);
+  }
+  try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
+  refreshSchedules();
+}
+
+/* Turn a repeating schedule into the same thing as exact one-shot runs. */
+async function convertRecurring(it) {
+  const base = parseStartDate(it.start_date);
+  const days = daysFromMask(it.repeat || 0);
+  if (!base || !days.length) { schedMessage('Cannot convert this schedule.', false); return; }
+  if (!window.confirm('Convert to exact runs?\n\nThe repeating entry is deleted and ' +
+      SCHED_HORIZON_DAYS + ' days of exact one-shot runs are created for the same days and time. ' +
+      'The app renews them whenever it is opened.')) return;
+  schedMessage('Converting…');
+  try {
+    await ensureAccess();
+    const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks/' +
+                           encodeURIComponent(it.scheduled_task_id), { method: 'DELETE' });
+    if (!res.ok) throw new Error('delete failed: HTTP ' + res.status);
+    const t = String(base.getHours()).padStart(2, '0') + ':' + String(base.getMinutes()).padStart(2, '0');
+    const task = it.task || 'sweep';
+    const dur = it.max_duration_in_minutes || 360;
+    // Save the definition BEFORE creating runs: the legacy entry is already
+    // deleted, so if run creation fails the renewal rebuilds the schedule.
+    upsertSchedDef({ task, hh: base.getHours(), mm: base.getMinutes(), dur,
+                     days: days.slice().sort((a, b) => a - b) });
+    const r = await createSchedRuns(task, t, days, dur);
+    schedMessage('Converted: ' + schedRunsNote(r) + '.', r.created > 0 && !r.failed);
+  } catch (e) {
+    schedMessage(e.message, false);
+  }
+  refreshSchedules();
 }
 
 async function deleteSchedule(taskId) {
@@ -2120,7 +2340,6 @@ async function addSchedule() {
   const t = $('sched-time') ? $('sched-time').value : '';
   if (!t) { schedMessage('Pick a time first.', false); return; }
   const days = state.schedDays ? Array.from(state.schedDays) : [];
-  const repeat = days.reduce((n, i) => n | (1 << i), 0);
   const task = ($('sched-task') && $('sched-task').value) || 'sweep';
   const dur = parseInt(($('sched-duration') && $('sched-duration').value) || '360', 10);
   const btn = $('btn-add-sched');
@@ -2129,31 +2348,20 @@ async function addSchedule() {
   try {
     await ensureAccess();
     await syncRobotTimezone();
-    // Compute start_date AFTER the clock/time-zone is reconciled so the first
-    // selected weekday is correct for the robot's own calendar.
-    const start_date = startDateFor(t, repeat);
-    const body = { task, start_date, enabled: true, repeat, max_duration_in_minutes: dur, version: 0 };
-    log('schedule add: ' + JSON.stringify(body));
-    const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
-                 'Accept': 'application/vnd.slamtec.scheduledtask-v1.0+json' },
-      body: JSON.stringify(body)
-    });
-    if (res.ok) {
-      let msg = 'Added: ' + taskLabel(task) + ' · ' + describeDays(repeat) + ' at ' + t + '.';
-      const stored = await verifyStoredSchedule(repeat, start_date);
-      if (stored === false) {
-        msg += ' Robot stored a different repeat — day-of-week may be ignored.';
-      } else if (stored && stored.repeat !== undefined && (stored.repeat | 0) !== repeat) {
-        msg += ' Server saved repeat=' + stored.repeat + ' (sent ' + repeat + ').';
-      }
-      schedMessage(msg, stored === false);
-      try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
-      refreshSchedules();
-    } else {
-      schedMessage('Add failed: HTTP ' + res.status + ' ' + String(res.body).slice(0, 100), false);
-    }
+    // Every run is created as an exact one-shot instant (repeat=0): this robot
+    // fires repeat-mask schedules one weekday early (firmware bug, verified
+    // 2026-11-10), but one-shots start at the exact requested minute.
+    const r = await createSchedRuns(task, t, days, dur);
+    const [hh, mm] = t.split(':').map(Number);
+    let msg = 'Added: ' + taskLabel(task) + ' · ' +
+      (days.length ? describeDays(maskFromDays(days)) : 'Once') +
+      ' at ' + fmtClock(new Date(2000, 0, 1, hh, mm)) + '.';
+    msg += ' ' + schedRunsNote(r) + '.';
+    if (r.failed) msg += ' ' + r.failed + ' run' + (r.failed === 1 ? '' : 's') + ' failed — check the list.';
+    schedMessage(msg, !r.failed);
+    if (days.length) upsertSchedDef({ task, hh: hh || 0, mm: mm || 0, dur,
+                                       days: days.slice().sort((a, b) => a - b) });
+    refreshSchedules();
   } catch (e) {
     schedMessage(e.message, false);
   } finally {
@@ -2161,54 +2369,7 @@ async function addSchedule() {
   }
 }
 
-/* Read the schedule list back and return the task that matches what we just
-   posted (same task + same clock time). Used to surface a mismatch between the
-   repeat mask we sent and the one the cloud actually stored. Returns null when
-   the list can't be read; false when the stored repeat is clearly wrong. */
-async function verifyStoredSchedule(repeat, start_date) {
-  try {
-    const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
-      headers: { 'Accept': 'application/vnd.slamtec.scheduledtasklist-v1.0+json' }
-    });
-    if (!res.ok) return null;
-    const j = JSON.parse(res.body);
-    const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
-    const want = parseStartDate(start_date);
-    const key = want ? (want.getHours() + ':' + want.getMinutes()) : '';
-    let match = null;
-    for (const it of items) {
-      const b = parseStartDate(it.start_date);
-      if (!b) continue;
-      if (b.getHours() + ':' + b.getMinutes() === key) match = it;
-    }
-    if (!match) return null;
-    log('schedule stored: ' + JSON.stringify(match).slice(0, 220));
-    if (match.repeat !== undefined && (match.repeat | 0) !== repeat) return false;
-    return match;
-  } catch (e) {
-    log('schedule verify failed: ' + e.message);
-    return null;
-  }
-}
-
-function startDateFor(t, mask) {
-  const [hh, mm] = t.split(':').map(Number);
-  const d = new Date();
-  d.setHours(hh || 0, mm || 0, 0, 0);
-  if (!mask) {
-    // one-shot → the next occurrence of this clock time
-    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
-  } else {
-    // Recurring → anchor start_date to the FIRST SELECTED WEEKDAY at/after now.
-    // Do NOT anchor to "today": the cloud/robot uses start_date as the first run
-    // date, and several firmwares ignore repeat for that first run. Anchoring to
-    // today made a Tue/Thu schedule run on the day the app was open.
-    const days = daysFromMask(mask);
-    let guard = 0;
-    while ((d.getTime() <= Date.now() || days.indexOf(d.getDay()) === -1) && guard++ < 14) {
-      d.setDate(d.getDate() + 1);
-    }
-  }
+function isoLocal(d) {
   const pad = (n) => String(n).padStart(2, '0');
   const off = -d.getTimezoneOffset();
   const sign = off >= 0 ? '+' : '-';
@@ -2216,6 +2377,168 @@ function startDateFor(t, mask) {
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
     'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':00.000' +
     sign + pad(Math.floor(offAbs / 60)) + pad(offAbs % 60);
+}
+
+/* Next occurrence of this clock time for a single ("Once") run. */
+function nextOneShot(t) {
+  const [hh, mm] = t.split(':').map(Number);
+  const d = new Date();
+  d.setHours(hh || 0, mm || 0, 0, 0);
+  if (d.getTime() <= Date.now() + SCHED_LEAD_MS) d.setDate(d.getDate() + 1);
+  return d;
+}
+
+/* All local-wall-clock occurrences of `t` ("HH:MM") on the given weekdays
+   (0 = Sunday) within `horizonDays`, never sooner than SCHED_LEAD_MS away. */
+function schedOccurrences(days, t, horizonDays) {
+  const [hh, mm] = t.split(':').map(Number);
+  const now = new Date();
+  const earliest = now.getTime() + SCHED_LEAD_MS;
+  const out = [];
+  for (let i = 0; i <= (horizonDays || SCHED_HORIZON_DAYS); i++) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i, hh || 0, mm || 0, 0, 0);
+    if (d.getTime() < earliest) continue;
+    if (days.indexOf(d.getDay()) === -1) continue;
+    out.push(d);
+  }
+  return out;
+}
+
+async function postOneShot(task, d, dur) {
+  const body = { task, start_date: isoLocal(d), enabled: true, repeat: 0,
+                 max_duration_in_minutes: dur, version: 0 };
+  return http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/vnd.slamtec.scheduledtask-v1.0+json',
+               'Accept': 'application/vnd.slamtec.scheduledtask-v1.0+json' },
+    body: JSON.stringify(body)
+  });
+}
+
+/* Create the exact runs for one schedule. Empty `days` → a single "Once" run.
+   Occurrences already queued for the same task, clock time and duration are
+   skipped, so re-adding or converting never double-books a minute. */
+async function createSchedRuns(task, t, days, dur) {
+  const occ = (days && days.length) ? schedOccurrences(days, t, SCHED_HORIZON_DAYS) : [nextOneShot(t)];
+  const [hh, mm] = t.split(':').map(Number);
+  const have = await existingOneShotMinutes(defKey(task, hh || 0, mm || 0, dur));
+  let created = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const d of occ) {
+    if (have.has(Math.round(d.getTime() / 60000))) { skipped++; continue; }
+    try {
+      const res = await postOneShot(task, d, dur);
+      if (res.ok) created++; else failed++;
+    } catch (e) { failed++; }
+  }
+  try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
+  return { created, failed, skipped, total: occ.length, last: occ.length ? occ[occ.length - 1] : null };
+}
+
+/* Minute-timestamps already queued for one schedule definition key. */
+async function existingOneShotMinutes(key) {
+  const have = new Set();
+  try {
+    const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks', {
+      headers: { 'Accept': 'application/vnd.slamtec.scheduledtasklist-v1.0+json' }
+    });
+    if (!res.ok) return have;
+    const j = JSON.parse(res.body);
+    const items = Array.isArray(j) ? j : (j.content || j.scheduled_tasks || j.data || []);
+    for (const it of items) {
+      if ((it.repeat || 0) !== 0) continue;
+      const b = parseStartDate(it.start_date);
+      if (!b) continue;
+      if (defKey(it.task, b.getHours(), b.getMinutes(), it.max_duration_in_minutes || 0) === key) {
+        have.add(Math.round(b.getTime() / 60000));
+      }
+    }
+  } catch (e) { /* best effort */ }
+  return have;
+}
+
+/* Renew every schedule out to the horizon and prune old runs.
+   Driven by BOTH the stored definitions (so a schedule survives an empty
+   cloud queue — e.g. the app was closed past the whole horizon) and the
+   one-shot groups still queued in the cloud (so schedules created on
+   another device keep renewing). Throttled so the normal list refresh
+   stays cheap; a renewal re-renders the list by calling refreshSchedules()
+   (which will not re-enter, thanks to the throttle + busy flag). */
+async function maybeTopUp(items) {
+  const defs = loadSchedDefs();
+  items = items || [];
+  if (!state.deviceId) return;
+  if (!items.length && !defs.length) return;
+  if (state._schedTopBusy) return;
+  const now = Date.now();
+  if (state._schedTopAt && now - state._schedTopAt < SCHED_TOPUP_MS) return;
+  state._schedTopAt = now;
+  state._schedTopBusy = true;
+  try {
+    await ensureAccess();
+    let created = 0;
+    let pruned = 0;
+    // Drop one-shot runs that fired (or were never going to fire) long ago.
+    for (const it of items) {
+      if ((it.repeat || 0) !== 0 || !it.scheduled_task_id) continue;
+      const b = parseStartDate(it.start_date);
+      if (!b || b.getTime() >= now - SCHED_PRUNE_MS) continue;
+      try {
+        const res = await http('/api/devices/' + state.deviceId + '/scheduled-tasks/' +
+                               encodeURIComponent(it.scheduled_task_id), { method: 'DELETE' });
+        if (res.ok) pruned++;
+      } catch (e) { /* leave it for next time */ }
+    }
+    // Minute timestamps already queued, per definition key. Successfully
+    // created minutes are added too, so a def and its cloud group never
+    // double-book the same occurrence.
+    const queued = new Map();
+    const note = (key, d) => {
+      let set = queued.get(key);
+      if (!set) { set = new Set(); queued.set(key, set); }
+      set.add(Math.round(d.getTime() / 60000));
+    };
+    for (const it of items) {
+      if ((it.repeat || 0) !== 0) continue;
+      const b = parseStartDate(it.start_date);
+      if (!b) continue;
+      note(defKey(it.task, b.getHours(), b.getMinutes(), it.max_duration_in_minutes || 0), b);
+    }
+    const ensure = async (task, hh, mm, dur, days) => {
+      const key = defKey(task, hh, mm, dur);
+      const t = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+      let added = 0;
+      for (const d of schedOccurrences(days, t, SCHED_HORIZON_DAYS)) {
+        if ((queued.get(key) || new Set()).has(Math.round(d.getTime() / 60000))) continue;
+        try {
+          const res = await postOneShot(task, d, dur);
+          if (res.ok) { added++; note(key, d); }
+        } catch (e) { /* skip this occurrence */ }
+      }
+      return added;
+    };
+    for (const def of defs) {
+      created += await ensure(def.task, def.hh, def.mm, def.dur, def.days);
+    }
+    for (const g of groupScheduleItems(items).groups) {
+      // Only renew groups that look like a chain (2+ queued runs). A lone
+      // one-shot is a "Once" run — recreating it weekly would be wrong; its
+      // schedule definition (if any) drives renewal instead.
+      if (g.entries.length < 2) continue;
+      created += await ensure(g.task, g.hh, g.mm, g.dur, g.days);
+    }
+    if (created || pruned) {
+      log('schedule renewal: +' + created + ' run' + (created === 1 ? '' : 's') +
+          ', pruned ' + pruned + ' past run' + (pruned === 1 ? '' : 's'));
+      try { if (state.mqtt && state.mqtt.connected) sendCmd(CMD.SYNC_SCHEDULE_TASK); } catch (e) {}
+      await refreshSchedules();
+    }
+  } catch (e) {
+    log('schedule renewal failed: ' + e.message);
+  } finally {
+    state._schedTopBusy = false;
+  }
 }
 
 function setSchedDays(mask) {
@@ -2831,6 +3154,11 @@ function wireControls() {
   buildSchedDays();
   const presetBox = $('sched-presets');
   if (presetBox) presetBox.querySelectorAll('.chip').forEach((c) => { c.onclick = () => { setSchedDays(+c.dataset.mask); schedMessage(''); }; });
+  // Renew the rolling one-shot runs whenever the app surfaces from the
+  // background — that is how the exact-run chain stays ahead of the robot.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state.device) refreshSchedules();
+  });
   on('btn-logout', logout);
   on('btn-copy-log', copyDiag);
   on('btn-voice-get', () => {
@@ -2999,6 +3327,9 @@ function clearState() {
   state._cloudCap = 20;
   state._helloLogged = false;
   state.schedDays = null;
+  state._schedTopAt = 0;
+  state._schedTopBusy = false;
+  try { localStorage.removeItem('jarvis.scheds'); } catch (e) {}
   const cl = $('cloud-maps'); if (cl) cl.innerHTML = '';
   const sl = $('schedule-list');
   if (sl) { sl.className = 'muted'; sl.textContent = '…'; }
