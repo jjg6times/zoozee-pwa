@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v53';
+const APP_VER = 'v54';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -3199,12 +3199,13 @@ function finalizeRun() {
   // A sweep that ends well before it could have covered the floor was cut
   // short (alert, stuck, failed dock...). Say so instead of silently logging a
   // tiny run — unless the user pressed Stop.
+  const ev = state.lastEvent && (Date.now() - state.lastEvent.ts < 180000) ? state.lastEvent : null;
+  const why = ev ? friendlyEvent(ev.key) : '';
   if (r.type !== 'Spot' && durSec < 300 &&
       Date.now() - (state._userStopAt || 0) > 120000) {
-    const ev = state.lastEvent && (Date.now() - state.lastEvent.ts < 180000) ? state.lastEvent : null;
-    const why = ev ? friendlyEvent(ev.key) : 'no alert was reported';
-    log(r.type + ' ended early after ' + fmtDur(durSec) + ' - ' + why);
-    ctrlMsg(r.type + ' ended early after ' + fmtDur(durSec) + ' - ' + why, true);
+    const reason = why || 'no alert was reported';
+    log(r.type + ' ended early after ' + fmtDur(durSec) + ' - ' + reason);
+    ctrlMsg(r.type + ' ended early after ' + fmtDur(durSec) + ' - ' + reason, true);
   }
   state.history.unshift({
     ts: r.startTs,
@@ -3212,6 +3213,7 @@ function finalizeRun() {
     durSec,
     areaM2: Math.round(area * 100) / 100,
     sweepSec: Math.round(r.maxTime || 0),
+    why,
     batt: state.battery
   });
   if (state.history.length > 50) state.history.length = 50;
@@ -3258,7 +3260,8 @@ function renderHistory() {
     const durSecs = e.sweepSec || e.durSec || 0;
     mt.textContent = (e.areaM2 ? e.areaM2 + ' m²' : '—') + '  ·  ' +
       (durSecs ? fmtDur(durSecs) : (e.unfinished ? 'no end time' : '—')) +
-      (e.batt != null ? '  ·  ' + e.batt + '%' : '');
+      (e.batt != null ? '  ·  ' + e.batt + '%' : '') +
+      (e.why ? '  ·  ' + e.why : '');
     txt.appendChild(nm);
     txt.appendChild(mt);
     row.appendChild(txt);
