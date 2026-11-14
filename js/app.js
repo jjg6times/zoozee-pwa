@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v52';
+const APP_VER = 'v53';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -19,7 +19,7 @@ const TYPE = {
   SWEEP_AREA: 20, DOCK_POSE: 21, ROBOT_STATUS: 22,
   SWEEP_REGION: 28, SWEEPING_REGION: 29, SWEEP_TIME: 12,
   SWEEP_FAN_MODE: 25, SMART_PRESSURIZATION: 58, NETWORK_INFO: 24,
-  DEVICE_VOICE_ID: 57, SILENCE_MODE: 27
+  DEVICE_VOICE_ID: 57, SILENCE_MODE: 27, SOUND_VOLUME: 60, SYSTEM_EVENT: 67
 };
 const CMD = {
   STOP: 24, GO_HOME: 25, SWEEP: 26, SWEEP_SPOT: 27, CLEAR_MAP: 54, FIND_ME: 56,
@@ -29,7 +29,8 @@ const CMD = {
   GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
   UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106, SYNC_SCHEDULE_TASK: 31,
   GET_VOICE_ID: 82, SET_VOICE_ID: 79,
-  GET_DO_NOT_DISTURB: 62, SET_DO_NOT_DISTURB: 63
+  GET_DO_NOT_DISTURB: 62, SET_DO_NOT_DISTURB: 63,
+  SET_VOICE_VOLUME: 86
 };
 const FAN_MODES = [
   { label: 'Normal', value: 0 },
@@ -55,7 +56,7 @@ const ACTION_LABELS = {
    CURRENT_ACTION.an -> 0 exploring/edge, 3 go-home, 4 sweep, 5 spot
    ROBOT_STATUS.p    -> 0 idle, 5 returning, 6 sweeping, 11 spot, 20 mapping, 22 edge */
 const ACTION_NUM = {
-  0: 'Exploring', 1: 'Returning home', 3: 'Returning home',
+  0: 'Exploring', 1: 'Idle', 3: 'Returning home',
   4: 'Sweeping', 5: 'Spot cleaning', 6: 'Edge sweeping'
 };
 const STATUS_LABELS = {
@@ -173,10 +174,17 @@ const state = {
   wifiTs: 0,
   lastContact: 0,      // last time any robot message was received (ms)
   reachable: false,    // robot answered an MQTT probe or sent traffic recently
+  lastEvent: null,     // last system event pushed by the robot (f=67)
+  _wasReturning: 0,    // last time the robot was heading home
+  _dockRetries: 0,     // auto re-dock attempts for the current return
+  _lastDockCmd: 0,
+  _userStopAt: 0,
   ctrlEnabled: false,
   fanMode: null,
   carpetBoost: null,   // smart pressurization (auto boost on carpet)
   muted: null,         // do-not-disturb / silence mode
+  volume: null,        // sound_volume_percent (0-100)
+  muteVolume: 100,     // volume to restore when unmuting
   area: null,          // cleaned area m2
   sweepTime: null,     // seconds
   view: { scale: 0, ox: 0, oy: 0, fit: true }, // px-per-meter + origin offset (CSS px)
@@ -435,6 +443,7 @@ function renderStatusNow() {
   }
   $('action-line').textContent = actionTxt;
   renderPose();
+  checkDockRetry();
 }
 
 /* Live pose readout: x, y, heading, and whether the fix is fresh (so you can
@@ -622,7 +631,7 @@ function setCtrlEnabled(on) {
 
 function sendCmd(f, p) {
   const m = state.mqtt;
-  if (!m.connected) { ctrlMsg('Not connected (robot offline?)', true); return; }
+  if (!m || !m.connected) { ctrlMsg('Not connected (robot offline?)', true); return; }
   if (!state.deviceId) { ctrlMsg('No robot selected', true); return; }
   const payload = JSON.stringify(p === undefined || p === null ? { f } : { f, p });
   m.publish('device/' + state.deviceId + '/robot', strToBytes(payload));
@@ -643,6 +652,10 @@ function requestSmartPress() {
 }
 function requestSilenceMode() {
   sendCmd(CMD.GET_DO_NOT_DISTURB);
+  requestVolume();
+}
+function requestVolume() {
+  sendCmd(CMD.SET_VOICE_VOLUME, {});
 }
 function setMuteButton() {
   const mb = $('btn-mute');
@@ -650,14 +663,71 @@ function setMuteButton() {
   mb.classList.toggle('active', !!state.muted);
   mb.textContent = state.muted ? 'Muted' : 'Mute';
 }
+// Robot's do-not-disturb model is {enable, s, e} (start/end times), *not*
+// {"enabled": bool} — the field name matters, otherwise the robot ignores it.
+const DND_ALL_DAY = { s: '00:00:00', e: '00:00:00' };
 function toggleMute() {
   const next = !state.muted;
   state.muted = next;
   setMuteButton();
-  sendCmd(CMD.SET_DO_NOT_DISTURB, { enabled: next });
+  sendCmd(CMD.SET_DO_NOT_DISTURB, Object.assign({ enable: next }, DND_ALL_DAY));
+  if (next) {
+    if (state.volume > 0) state.muteVolume = state.volume;
+    sendCmd(CMD.SET_VOICE_VOLUME, { sound_volume_percent: 0 });
+  } else {
+    sendCmd(CMD.SET_VOICE_VOLUME, { sound_volume_percent: state.muteVolume || 100 });
+  }
+  requestVolume();
 }
 function requestNetworkInfo() {
   sendCmd(CMD.NETWORK_INFO);
+}
+
+const EVENT_TEXT = {
+  'device.vacuum.error': 'vacuum error - check the dust bin and brush',
+  'device.vacuum.bin.full': 'dust bin is full',
+  'device.low.battery': 'battery low',
+  'device.stuck': 'robot is stuck',
+  'device.wheel.error': 'wheel error',
+  'device.bumper.error': 'bumper is blocked'
+};
+function friendlyEvent(key) {
+  return EVENT_TEXT[key] || String(key).replace(/^device\./, '').replace(/[._]/g, ' ');
+}
+
+/* If a return-home ends with the robot idle but not on the charger and still
+   within a few metres of the dock, ask it to try again (max two attempts).
+   A manual Stop cancels this for 10 minutes. */
+function autoDockEnabled() { return localStorage.getItem('jarvis.autodock') !== '0'; }
+function checkDockRetry() {
+  const now = Date.now();
+  const st = state.status;
+  const an = state.action && state.action.an;
+  // an=1 is idle (the robot reports it while parked); an=3 is return-home.
+  const returning = st === 5 || st === 9 || an === 3;
+  if (returning) {
+    if (!state._wasReturning) state._dockRetries = 0;
+    state._wasReturning = now;
+    return;
+  }
+  if (!state._wasReturning) return;
+  const idle = st === 0 || st === 1 || st === 21 || an === 1;
+  if (!idle) return;
+  if (state.charging) { state._wasReturning = 0; state._dockRetries = 0; return; }
+  if (!autoDockEnabled()) return;
+  if (now - (state._userStopAt || 0) < 600000) { state._wasReturning = 0; return; }
+  const dock = state.dock, pose = state.pose;
+  if (!dock || !pose) { state._wasReturning = 0; return; }
+  const dist = Math.hypot(pose.x - dock.x, pose.y - dock.y);
+  if (dist > 3 || dist <= 0.35) { state._wasReturning = 0; return; }
+  if (now - state._wasReturning > 180000) { state._wasReturning = 0; return; }
+  if ((state._dockRetries || 0) >= 2) { state._wasReturning = 0; return; }
+  if (now - (state._lastDockCmd || 0) < 25000) return;
+  state._dockRetries = (state._dockRetries || 0) + 1;
+  state._lastDockCmd = now;
+  log('stopped ' + dist.toFixed(1) + ' m from dock - re-docking (attempt ' + state._dockRetries + ')');
+  ctrlMsg('Stopped short of dock - retrying', false);
+  sendCmd(CMD.GO_HOME);
 }
 function requestEntireMap(force) {
   // Throttle: if the robot is already streaming live tiles there's no need to
@@ -773,6 +843,7 @@ function handleAppMessage(topic, payload, raw) {
     case TYPE.ROBOT_STATUS:
       state.status = null;
       if (typeof p === 'number') {
+        state.status = p;
         state.statusText = STATUS_LABELS[p] || ('Working (' + p + ')');
       } else if (p && typeof p === 'object') {
         state.status = p;
@@ -812,12 +883,40 @@ function handleAppMessage(topic, payload, raw) {
         if (cb) cb.checked = state.carpetBoost;
       }
       break;
+    case TYPE.SYSTEM_EVENT: {
+      const evs = (p && Array.isArray(p.events)) ? p.events : [];
+      for (const ev of evs) {
+        const key = String((ev && ev.key) || 'system event');
+        const kind = String((ev && ev.type) || '');
+        log('robot event: ' + key + (kind ? ' [' + kind + ']' : ''));
+        state.lastEvent = { key, kind, ts: Date.now() };
+        ctrlMsg('Robot alert: ' + friendlyEvent(key), true);
+      }
+      break;
+    }
     case TYPE.SILENCE_MODE: {
       const en = (p && typeof p === 'object')
-        ? (p.enabled !== undefined ? p.enabled : p.value)
+        ? (p.enable !== undefined ? p.enable
+          : (p.enabled !== undefined ? p.enabled : p.value))
         : p;
       state.muted = !!en;
       setMuteButton();
+      break;
+    }
+    case TYPE.SOUND_VOLUME: {
+      const raw = (p && typeof p === 'object')
+        ? (p.sound_volume_percent !== undefined ? p.sound_volume_percent : p.volume)
+        : p;
+      if (raw !== undefined && raw !== null) {
+        const v = Number(raw);
+        if (Number.isFinite(v)) {
+          state.volume = v;
+          if (v > 0) state.muteVolume = v;
+          // Volume 0 *is* the mute state, so keep the button honest even if the
+          // silence-mode report is missing.
+          if (v === 0 && !state.muted) { state.muted = true; setMuteButton(); }
+        }
+      }
       break;
     }
     case TYPE.NETWORK_INFO:
@@ -2953,28 +3052,47 @@ function loadHistory() {
   try { state.history = JSON.parse(localStorage.getItem(historyKey()) || '[]'); }
   catch (e) { state.history = []; }
   if (!Array.isArray(state.history)) state.history = [];
+  // Drop rows written by the old wall-clock timer (the "68 h run" bug) or with
+  // a start time in the future.
+  const before = state.history.length;
+  const now = Date.now();
+  state.history = state.history.filter(e => e && e.ts && e.ts <= now + 60000 &&
+    (!e.durSec || e.durSec <= MAX_RUN_SEC) &&
+    (!e.sweepSec || e.sweepSec <= MAX_RUN_SEC));
+  if (state.history.length !== before) persistHistory();
   renderHistory();
 }
 function taskTypeLabel(t) {
   t = String(t || '');
-  if (/sweep/i.test(t)) return 'Sweep';
-  if (/map|explor/i.test(t)) return 'Mapping';
+  // Check spot/edge first: their cloud task names are SweepSpotAction and
+  // SweepEdgeAction, which would otherwise be labelled "Sweep".
   if (/spot/i.test(t)) return 'Spot';
   if (/edge/i.test(t)) return 'Edge';
+  if (/sweep/i.test(t)) return 'Sweep';
+  if (/map|explor/i.test(t)) return 'Mapping';
   if (/goto/i.test(t)) return 'GoTo';
   return t.replace(/Action$/, '') || 'Task';
 }
 function parseCloudTask(e) {
   const start = Date.parse(e.started_time || e.created || e.last_updated || '') || 0;
-  const end = Date.parse(e.finished_time || e.last_updated || e.created || '') || start;
+  const finished = Date.parse(e.finished_time || '') || 0;
+  const updated = Date.parse(e.last_updated || e.created || '') || start;
+  const status = e.status || '';
+  const running = !finished && /run|progress|start/i.test(status);
+  // The cloud leaves abandoned tasks in "Running" forever when a command is
+  // retried or the robot reboots. Those used to show up as absurd durations
+  // (68 h) because the end time fell back to last_updated.
+  const stale = running && (Date.now() - updated > 15 * 60 * 1000);
+  const durSec = (finished && start) ? Math.max(0, Math.round((finished - start) / 1000)) : null;
   return {
     taskId: e.task_id || null,
     ts: start,
     type: taskTypeLabel(e.task),
-    durSec: Math.max(0, Math.round((end - start) / 1000)),
+    durSec,
     areaM2: 0,
-    status: e.status || '',
+    status: stale ? 'Incomplete' : status,
     batt: null,
+    unfinished: !finished,
     src: 'cloud'
   };
 }
@@ -2999,8 +3117,21 @@ function historyList() {
     const dup = list.some(l => l.type === c.type && Math.abs((l.ts || 0) - c.ts) < 120000);
     if (!dup) list.push(c);
   }
-  list.sort((a, b) => (b.ts || 0) - (a.ts || 0));
-  return list;
+  // The cloud creates a task for every command it receives, so one sweep can
+  // appear 2-3 times seconds apart (and retries leave zombie "Running" rows).
+  // Collapse records of the same type that started within two minutes and keep
+  // the one that actually has an end time.
+  const locals = list.filter(e => e.src !== 'cloud');
+  const cloud = list.filter(e => e.src === 'cloud').sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  const kept = [];
+  for (const e of cloud) {
+    const near = kept.find(k => k.type === e.type && Math.abs((k.ts || 0) - (e.ts || 0)) < 120000);
+    if (!near) { kept.push(e); continue; }
+    const better = (!near.durSec && e.durSec) ||
+                   (near.unfinished && !e.unfinished);
+    if (better) kept[kept.indexOf(near)] = e;
+  }
+  return locals.concat(kept).sort((a, b) => (b.ts || 0) - (a.ts || 0));
 }
 function persistHistory() {
   try { localStorage.setItem(historyKey(), JSON.stringify(state.history)); } catch (e) { /* noop */ }
@@ -3025,17 +3156,26 @@ function currentRunType() {
   if (/spot/i.test(t)) return 'Spot';
   return null;
 }
+const MAX_RUN_SEC = 12 * 3600; // anything longer is a tracking artefact, not a clean
 function trackRun() {
   const type = currentRunType();
   const r = state.run;
+  const now = Date.now();
   if (!type) { if (r) finalizeRun(); return; }
   if (!r || r.type !== type) {
     if (r) finalizeRun();
+    state._wasReturning = 0;
+    state._dockRetries = 0;
     state.run = {
-      type, startTs: Date.now(),
-      startArea: state.area || 0, maxArea: state.area || 0, maxTime: state.sweepTime || 0
+      type, startTs: now, lastSeen: now,
+      startArea: state.area || 0, maxArea: state.area || 0,
+      startTime: state.sweepTime || 0, maxTime: state.sweepTime || 0
     };
   } else {
+    // A long silence means the app wasn't watching (tab asleep, token lost,
+    // robot offline). Don't count that gap as cleaning time.
+    if (r.lastSeen && now - r.lastSeen > 90000) r.startTs += now - r.lastSeen;
+    r.lastSeen = now;
     r.maxArea = Math.max(r.maxArea, state.area || 0);
     r.maxTime = Math.max(r.maxTime, state.sweepTime || 0);
   }
@@ -3044,9 +3184,28 @@ function finalizeRun() {
   const r = state.run;
   state.run = null;
   if (!r) return;
-  const durSec = Math.round((Date.now() - r.startTs) / 1000);
+  const wallSec = Math.round((Date.now() - r.startTs) / 1000);
+  // The robot's own sweep clock (f=12) is authoritative. Fall back to the
+  // wall clock when it is missing, or when it looks cumulative (much larger
+  // than the wall time we observed).
+  let durSec = Math.round(r.maxTime || 0);
+  if (durSec <= 0 || (durSec > wallSec + 120 && durSec > 1800)) durSec = wallSec;
+  // The robot starts each run's clock at zero; clear it so the next run cannot
+  // inherit the previous duration.
+  state.sweepTime = 0;
+  if (durSec <= 0 || durSec > MAX_RUN_SEC) return; // never log bogus multi-day runs
   const area = r.maxArea || 0;
   if (durSec < 15 && area < 1) return; // ignore blips / false starts
+  // A sweep that ends well before it could have covered the floor was cut
+  // short (alert, stuck, failed dock...). Say so instead of silently logging a
+  // tiny run — unless the user pressed Stop.
+  if (r.type !== 'Spot' && durSec < 300 &&
+      Date.now() - (state._userStopAt || 0) > 120000) {
+    const ev = state.lastEvent && (Date.now() - state.lastEvent.ts < 180000) ? state.lastEvent : null;
+    const why = ev ? friendlyEvent(ev.key) : 'no alert was reported';
+    log(r.type + ' ended early after ' + fmtDur(durSec) + ' - ' + why);
+    ctrlMsg(r.type + ' ended early after ' + fmtDur(durSec) + ' - ' + why, true);
+  }
   state.history.unshift({
     ts: r.startTs,
     type: r.type,
@@ -3077,7 +3236,7 @@ function renderHistory() {
     return;
   }
   let area = 0, dur = 0;
-  for (const e of list) { area += e.areaM2 || 0; dur += e.durSec || 0; }
+  for (const e of list) { area += e.areaM2 || 0; dur += (e.sweepSec || e.durSec || 0); }
   if (sum) sum.textContent = list.length + ' runs · ' + area.toFixed(1) + ' m² · ' + fmtDur(dur) + ' total';
   for (const e of list) {
     const row = document.createElement('div');
@@ -3096,7 +3255,10 @@ function renderHistory() {
     }
     const mt = document.createElement('div');
     mt.className = 'muted small';
-    mt.textContent = (e.areaM2 ? e.areaM2 + ' m²' : '—') + '  ·  ' + fmtDur(e.sweepSec || e.durSec) + (e.batt != null ? '  ·  ' + e.batt + '%' : '');
+    const durSecs = e.sweepSec || e.durSec || 0;
+    mt.textContent = (e.areaM2 ? e.areaM2 + ' m²' : '—') + '  ·  ' +
+      (durSecs ? fmtDur(durSecs) : (e.unfinished ? 'no end time' : '—')) +
+      (e.batt != null ? '  ·  ' + e.batt + '%' : '');
     txt.appendChild(nm);
     txt.appendChild(mt);
     row.appendChild(txt);
@@ -3114,9 +3276,16 @@ function clearHistory() {
 function setVoiceStatus(t, err){const el=$('voice-status');if(!el)return;el.textContent=t||'';el.className='status-line small '+(err?'':'muted');}
 
 function wireControls() {
+  const ad = $('auto-dock');
+  if (ad) {
+    ad.checked = autoDockEnabled();
+    ad.addEventListener('change', () => {
+      localStorage.setItem('jarvis.autodock', ad.checked ? '1' : '0');
+    });
+  }
   on('btn-sweep', () => sendCmd(CMD.SWEEP));
   on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
-  on('btn-stop', () => sendCmd(CMD.STOP));
+  on('btn-stop', () => { state._userStopAt = Date.now(); sendCmd(CMD.STOP); });
   on('btn-home', () => sendCmd(CMD.GO_HOME));
   on('btn-find', () => sendCmd(CMD.FIND_ME));
   on('btn-spot', toggleSpot);
@@ -3286,6 +3455,7 @@ function clearState() {
   const cbEl = $('carpet-boost');
   if (cbEl) cbEl.checked = false;
   state.muted = null;
+  state.volume = null;
   setMuteButton();
   state.wifi = null;
   state.wifiTs = 0;
