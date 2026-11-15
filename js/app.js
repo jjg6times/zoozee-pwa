@@ -11,13 +11,13 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v54';
+const APP_VER = 'v55';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
   ENTIRE_EXPLORE_MAP: 17, ENTIRE_SWEEP_MAP: 18, ROBOTTRACK: 19,
   SWEEP_AREA: 20, DOCK_POSE: 21, ROBOT_STATUS: 22,
-  SWEEP_REGION: 28, SWEEPING_REGION: 29, SWEEP_TIME: 12,
+  SWEEP_REGION: 28, SWEEPING_REGION: 29, SET_MAP_RESPONSE: 31, SWEEP_TIME: 12,
   SWEEP_FAN_MODE: 25, SMART_PRESSURIZATION: 58, NETWORK_INFO: 24,
   DEVICE_VOICE_ID: 57, SILENCE_MODE: 27, SOUND_VOLUME: 60, SYSTEM_EVENT: 67
 };
@@ -26,6 +26,7 @@ const CMD = {
   START_SWEEP_REGION: 68, START_AUTO_EXPLORING: 108, START_EDGE_SWEEPING: 109,
   GET_VIRTUAL_WALL: 28, UPDATE_VIRTUAL_WALL: 29, GET_SWEEP_FAN_MODE: 58, SET_SWEEP_FAN_MODE: 59,
   GET_SMART_PRESSURIZATION: 83, NETWORK_INFO: 57, ENTIRE_MAP: 42,
+  SET_MAP: 72, GET_DOCK_POSE: 21,
   GET_SWEEP_REGION: 64, CREATE_SWEEP_REGION: 65, DELETE_SWEEP_REGION: 66,
   UPDATE_SWEEP_REGION: 67, SET_TIMEZONE: 106, SYNC_SCHEDULE_TASK: 31,
   GET_VOICE_ID: 82, SET_VOICE_ID: 79,
@@ -175,6 +176,7 @@ const state = {
   lastContact: 0,      // last time any robot message was received (ms)
   reachable: false,    // robot answered an MQTT probe or sent traffic recently
   lastEvent: null,     // last system event pushed by the robot (f=67)
+  _mapUse: null,       // pending SET_MAP request {id,name,at}
   _wasReturning: 0,    // last time the robot was heading home
   _dockRetries: 0,     // auto re-dock attempts for the current return
   _lastDockCmd: 0,
@@ -891,6 +893,25 @@ function handleAppMessage(topic, payload, raw) {
         log('robot event: ' + key + (kind ? ' [' + kind + ']' : ''));
         state.lastEvent = { key, kind, ts: Date.now() };
         ctrlMsg('Robot alert: ' + friendlyEvent(key), true);
+      }
+      break;
+    }
+    case TYPE.SET_MAP_RESPONSE: {
+      // f=72 SET_MAP answers with f=31 {"response": true|false}.
+      const req = state._mapUse;
+      state._mapUse = null;
+      const ok = p && typeof p === 'object'
+        ? (p.response !== false && p.result !== false && p.success !== false)
+        : p !== false;
+      const what = req ? ('"' + req.name + '"') : 'map';
+      if (ok) {
+        log('robot loaded map ' + what);
+        ctrlMsg('robot switched to ' + what, false);
+        sendCmd(CMD.GET_VIRTUAL_WALL);
+        sendCmd(CMD.GET_DOCK_POSE);
+      } else {
+        log('robot refused map ' + what + ': ' + JSON.stringify(p));
+        ctrlMsg('robot could not load ' + what, true);
       }
       break;
     }
@@ -2944,9 +2965,10 @@ function renderCloudList() {
 
   for (const r of rows) {
     const id = r.m.map_id || r.m.id;
-    el.appendChild(mapRow(r.name, fmt(r.m), [
-      { label: 'Load', cls: 'xs', fn: () => loadCloudMap(id, r.name) }
-    ]));
+    const isCur = !!(state.device && state.device.current_map === id);
+    const acts = [{ label: 'View', cls: 'xs', fn: () => loadCloudMap(id, r.name) }];
+    if (!isCur) acts.push({ label: 'Use', cls: 'xs', fn: () => useMapOnRobot(id, r.name) });
+    el.appendChild(mapRow(isCur ? r.name + ' (in use)' : r.name, fmt(r.m), acts));
   }
   const hidden = state.cloudMaps.length - rows.length;
   if (hidden > 0) {
@@ -2957,6 +2979,29 @@ function renderCloudList() {
     more.onclick = () => { state._cloudCap = cap + 20; renderCloudList(); };
     el.appendChild(more);
   }
+}
+
+/* Tell the robot to switch to a map that already exists in the account. The
+   robot answers SET_MAP (f=72) with f=31 {"response": true|false}. This is
+   non-destructive: every map stays in the cloud, so switching back is possible. */
+function useMapOnRobot(id, name) {
+  if (!id) { ctrlMsg('map has no id', true); return; }
+  const cur = state.device && state.device.current_map;
+  if (cur === id) { ctrlMsg('robot is already using this map', false); return; }
+  const label = name || ('map ' + String(id).slice(0, 8));
+  if (!window.confirm('Switch the robot to "' + label + '"?\n\n' +
+      'The robot will reload this map and its walls, then try to relocalize.')) return;
+  state._mapUse = { id, name: label, at: Date.now() };
+  sendCmd(CMD.SET_MAP, { map_id: id });
+  ctrlMsg('asked robot to load ' + label + '…', false);
+  log('SET_MAP -> ' + label + ' (' + id + ')');
+  clearTimeout(state._mapUseTimer);
+  state._mapUseTimer = setTimeout(() => {
+    if (state._mapUse && state._mapUse.id === id) {
+      state._mapUse = null;
+      ctrlMsg('robot did not confirm the map switch', true);
+    }
+  }, 30000);
 }
 
 async function loadCloudMap(id, name) {
