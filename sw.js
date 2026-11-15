@@ -1,4 +1,4 @@
-const CACHE = 'jarvis-remote-v55';
+const CACHE = 'jarvis-remote-v56';
 const ASSETS = [
   './',
   './index.html',

@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v55';
+const APP_VER = 'v56';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -180,6 +180,7 @@ const state = {
   _wasReturning: 0,    // last time the robot was heading home
   _dockRetries: 0,     // auto re-dock attempts for the current return
   _lastDockCmd: 0,
+  _dockGiveUpAt: 0,    // stop auto re-docking for 10 min after two failures
   _userStopAt: 0,
   ctrlEnabled: false,
   fanMode: null,
@@ -708,14 +709,16 @@ function checkDockRetry() {
   // an=1 is idle (the robot reports it while parked); an=3 is return-home.
   const returning = st === 5 || st === 9 || an === 3;
   if (returning) {
-    if (!state._wasReturning) state._dockRetries = 0;
+    // Never reset the retry budget here: the robot's own 9 -> 0 -> 9 dock
+    // search cycle would otherwise clear the cap and we would re-send GO_HOME
+    // forever. The budget is reset on charge, a new run, or a manual Home.
     state._wasReturning = now;
     return;
   }
   if (!state._wasReturning) return;
   const idle = st === 0 || st === 1 || st === 21 || an === 1;
   if (!idle) return;
-  if (state.charging) { state._wasReturning = 0; state._dockRetries = 0; return; }
+  if (state.charging) { state._wasReturning = 0; state._dockRetries = 0; state._dockGiveUpAt = 0; return; }
   if (!autoDockEnabled()) return;
   if (now - (state._userStopAt || 0) < 600000) { state._wasReturning = 0; return; }
   const dock = state.dock, pose = state.pose;
@@ -723,7 +726,10 @@ function checkDockRetry() {
   const dist = Math.hypot(pose.x - dock.x, pose.y - dock.y);
   if (dist > 3 || dist <= 0.35) { state._wasReturning = 0; return; }
   if (now - state._wasReturning > 180000) { state._wasReturning = 0; return; }
-  if ((state._dockRetries || 0) >= 2) { state._wasReturning = 0; return; }
+  // After the two attempts fail, stay quiet for 10 minutes so a robot that
+  // keeps cycling docking states cannot trigger an endless retry loop.
+  if (now - (state._dockGiveUpAt || 0) < 600000) { state._wasReturning = 0; return; }
+  if ((state._dockRetries || 0) >= 2) { state._wasReturning = 0; state._dockGiveUpAt = now; return; }
   if (now - (state._lastDockCmd || 0) < 25000) return;
   state._dockRetries = (state._dockRetries || 0) + 1;
   state._lastDockCmd = now;
@@ -3211,6 +3217,7 @@ function trackRun() {
     if (r) finalizeRun();
     state._wasReturning = 0;
     state._dockRetries = 0;
+    state._dockGiveUpAt = 0;
     state.run = {
       type, startTs: now, lastSeen: now,
       startArea: state.area || 0, maxArea: state.area || 0,
@@ -3334,7 +3341,12 @@ function wireControls() {
   on('btn-sweep', () => sendCmd(CMD.SWEEP));
   on('btn-edge', () => sendCmd(CMD.START_EDGE_SWEEPING));
   on('btn-stop', () => { state._userStopAt = Date.now(); sendCmd(CMD.STOP); });
-  on('btn-home', () => sendCmd(CMD.GO_HOME));
+  on('btn-home', () => {
+    state._dockRetries = 0;
+    state._dockGiveUpAt = 0;
+    state._wasReturning = 0;
+    sendCmd(CMD.GO_HOME);
+  });
   on('btn-find', () => sendCmd(CMD.FIND_ME));
   on('btn-spot', toggleSpot);
   on('btn-all-clear', () => {
