@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v56';
+const APP_VER = 'v57';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -913,6 +913,15 @@ function handleAppMessage(topic, payload, raw) {
       if (ok) {
         log('robot loaded map ' + what);
         ctrlMsg('robot switched to ' + what, false);
+        /* Walls belong to a map. Drop the previous map's list so it can never be
+           re-saved onto the new map, and let the robot's f=9 repopulate it. */
+        state.walls = [];
+        state.wallDirty = false;
+        state.wallSelId = null;
+        state._lastWallRaw = null;
+        state._wallVer++;
+        setWallBank();
+        drawMap$();
         sendCmd(CMD.GET_VIRTUAL_WALL);
         sendCmd(CMD.GET_DOCK_POSE);
       } else {
