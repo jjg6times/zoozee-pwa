@@ -11,7 +11,7 @@ const CFG = {
 };
 
 /* OAuth token types / MQTT data types */
-const APP_VER = 'v57';
+const APP_VER = 'v58';
 const TYPE = {
   POSE: 1, CURRENT_ACTION: 2, BATTERY_PERCENTAGE: 3, BATTERY_IS_CHARGING: 4,
   EXPLORE_MAP: 7, SWEEP_MAP: 8, VIRTUAL_WALLS: 9, HELLO: 16,
@@ -55,16 +55,24 @@ const ACTION_LABELS = {
 };
 /* The Z70 firmware sends NUMERIC codes (verified live, 2026):
    CURRENT_ACTION.an -> 0 exploring/edge, 3 go-home, 4 sweep, 5 spot
-   ROBOT_STATUS.p    -> 0 idle, 5 returning, 6 sweeping, 11 spot, 20 mapping, 22 edge */
+   ROBOT_STATUS.p    -> see STATUS_LABELS below */
 const ACTION_NUM = {
   0: 'Exploring', 1: 'Idle', 3: 'Returning home',
   4: 'Sweeping', 5: 'Spot cleaning', 6: 'Edge sweeping'
 };
+/* ROBOT_STATUS (f=22) ids, taken verbatim from the firmware enum (w3.i in the
+   official APK). Do not renumber these from guesswork: 1 is CHARGING (not
+   idle) and 21 is AUTO_EXPLORING_PAUSED (not docked). Getting that wrong made
+   the auto re-dock logic fire GO_HOME at a robot that was already charging. */
 const STATUS_LABELS = {
-  0: 'Idle', 1: 'Idle', 2: 'Charging', 3: 'Charging', 4: 'Charge complete',
-  5: 'Returning to dock', 6: 'Sweeping', 7: 'Paused', 8: 'Paused', 9: 'Docking',
-  10: 'Charging', 11: 'Spot cleaning', 12: 'Spot cleaning', 13: 'Recharging',
-  20: 'Mapping', 21: 'Docked', 22: 'Edge sweeping'
+  0: 'Idle', 1: 'Charging', 2: 'Charged', 3: 'Charging for sweep',
+  4: 'Returning to charge', 5: 'Returning to dock', 6: 'Sweeping',
+  7: 'Sweep paused', 8: 'Recovering localization', 9: 'Moving manually',
+  10: 'Unknown', 11: 'Spot cleaning', 12: 'Spot paused',
+  13: 'Return home paused', 14: 'Region sweep', 15: 'Region sweep paused',
+  16: 'Drawing sweep', 17: 'Drawing sweep paused', 18: 'Smart sweep',
+  19: 'Smart sweep paused', 20: 'Mapping', 21: 'Mapping paused',
+  22: 'Edge sweeping', 23: 'Edge sweeping paused'
 };
 
 /* ================= state ================= */
@@ -700,25 +708,33 @@ function friendlyEvent(key) {
 
 /* If a return-home ends with the robot idle but not on the charger and still
    within a few metres of the dock, ask it to try again (max two attempts).
-   A manual Stop cancels this for 10 minutes. */
+   A manual Stop cancels this for 10 minutes.
+   Status ids come from the firmware enum (w3.i): 0 IDLE, 1 CHARGING,
+   2 BATTERY_FULL, 3 CHARGING_FOR_SWEEP, 4 BACK_TO_CHARGE, 5 BACK_HOME,
+   9 MANUAL_MOVE, 13 BACK_HOME_PAUSED. */
 function autoDockEnabled() { return localStorage.getItem('jarvis.autodock') !== '0'; }
 function checkDockRetry() {
   const now = Date.now();
   const st = state.status;
   const an = state.action && state.action.an;
-  // an=1 is idle (the robot reports it while parked); an=3 is return-home.
-  const returning = st === 5 || st === 9 || an === 3;
+  // Only a genuine return-home arms the retry. MANUAL_MOVE (9) must not: the
+  // docking manoeuvre itself reports 9, and so does the user driving by hand.
+  const returning = st === 4 || st === 5 || an === 3;
   if (returning) {
-    // Never reset the retry budget here: the robot's own 9 -> 0 -> 9 dock
-    // search cycle would otherwise clear the cap and we would re-send GO_HOME
-    // forever. The budget is reset on charge, a new run, or a manual Home.
+    // Never reset the retry budget here: the robot's own dock search cycle
+    // would otherwise clear the cap and we would re-send GO_HOME forever.
+    // The budget is reset on charge, a new run, or a manual Home.
     state._wasReturning = now;
     return;
   }
   if (!state._wasReturning) return;
-  const idle = st === 0 || st === 1 || st === 21 || an === 1;
+  // Parked: idle, or a return-home that stopped short and gave up.
+  const idle = st === 0 || st === 13 || an === 1;
   if (!idle) return;
-  if (state.charging) { state._wasReturning = 0; state._dockRetries = 0; state._dockGiveUpAt = 0; return; }
+  // Any charge state means it is on the pads, whatever f=4 says.
+  if (state.charging || st === 1 || st === 2 || st === 3) {
+    state._wasReturning = 0; state._dockRetries = 0; state._dockGiveUpAt = 0; return;
+  }
   if (!autoDockEnabled()) return;
   if (now - (state._userStopAt || 0) < 600000) { state._wasReturning = 0; return; }
   const dock = state.dock, pose = state.pose;
@@ -3204,10 +3220,11 @@ function currentRunType() {
   if (an === 5) return 'Spot';
   if (an === 6) return 'Edge';
   const st = state.status;
-  if (st === 6) return 'Sweep';
+  if (st === 6 || st === 7 || st === 14 || st === 15 || st === 16 ||
+      st === 17 || st === 18 || st === 19) return 'Sweep';
   if (st === 11 || st === 12) return 'Spot';
-  if (st === 20) return 'Mapping';
-  if (st === 22) return 'Edge';
+  if (st === 20 || st === 21) return 'Mapping';
+  if (st === 22 || st === 23) return 'Edge';
   const t = state.statusText || '';
   if (/return|dock|charg|idle|complete/i.test(t)) return null;
   if (/sweep/i.test(t)) return 'Sweep';
